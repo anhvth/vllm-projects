@@ -5,6 +5,8 @@ REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$REPO_ROOT/.venv"
 VLLM_PATCH_DIR="$REPO_ROOT/vllm_patch"
 
+cd "$REPO_ROOT"
+
 echo "=== Step 0: Remove old venv ==="
 if [ -d "$VENV_DIR" ]; then
   rm -rf "$VENV_DIR"
@@ -14,12 +16,8 @@ echo "=== Step 1: Create Python 3.12 venv ==="
 uv venv --python 3.12 "$VENV_DIR" --seed
 source "$VENV_DIR/bin/activate"
 
-echo "=== Step 2: Install prebuilt vLLM wheel ==="
-uv pip install -U vllm --pre \
-  --extra-index-url https://wheels.vllm.ai/nightly/cu129 \
-  --extra-index-url https://download.pytorch.org/whl/cu129 \
-  --torch-backend=auto \
-  --index-strategy unsafe-best-match
+echo "=== Step 2: Install locked prebuilt vLLM environment ==="
+uv sync --locked --active
 
 echo "=== Step 3: Enable local vLLM hotpatch overlay ==="
 SITE_PACKAGES="$("$VENV_DIR/bin/python" - <<'PY'

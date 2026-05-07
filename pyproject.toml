@@ -1,0 +1,28 @@
+[project]
+name = "vllm-hotload-workspace"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "vllm==0.20.2rc1.dev107+g2a16ece2d.cu129",
+  "torch==2.11.0+cu129",
+  "torchaudio==2.11.0+cu129",
+  "torchvision==0.26.0+cu129",
+  "triton==3.6.0",
+  "jupyterlab>=4.6.0a5",
+]
+
+[tool.uv]
+package = false
+prerelease = "allow"
+index-strategy = "unsafe-best-match"
+environments = ["sys_platform == 'linux'"]
+
+[[tool.uv.index]]
+name = "vllm-nightly-cu129"
+url = "https://wheels.vllm.ai/nightly/cu129"
+explicit = false
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = false
