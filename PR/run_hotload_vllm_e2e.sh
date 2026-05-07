@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VLLM_DIR="$BASE_DIR/vllm"
+VLLM_PATCH_DIR="$BASE_DIR/vllm_patch"
 VENV_DIR="$BASE_DIR/.venv"
 PYTHON_BIN="$VENV_DIR/bin/python"
 LOG_DIR="$BASE_DIR/PR/logs"
@@ -119,8 +119,9 @@ start_server() {
 
     echo "Starting dummy-weight vLLM server"
     (
-        cd "$VLLM_DIR"
-        export PYTHONPATH="$VLLM_DIR"
+        cd "$BASE_DIR"
+        export PYTHONPATH="$VLLM_PATCH_DIR"
+        unset VLLM_API_KEY
         export VLLM_SERVER_DEV_MODE=1
         export VLLM_ALLOW_INSECURE_SERIALIZATION=1
         exec "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
@@ -175,18 +176,21 @@ run_push_example() {
 
     (
         cd "$BASE_DIR"
-        export PYTHONPATH="$VLLM_DIR"
+        export PYTHONPATH="$VLLM_PATCH_DIR"
         export VLLM_ALLOW_INSECURE_SERIALIZATION=1
-        "$PYTHON_BIN" "$VLLM_DIR/examples/managed_weight_sync/hf_push_ipc.py" \
+        "$PYTHON_BIN" "$VLLM_PATCH_DIR/examples/managed_weight_sync/hf_push_ipc.py" \
             --model-path "$model_path" \
             --base-url "$BASE_URL" \
             --served-model-name "$SERVED_MODEL_NAME" \
+            --target-devices "$(seq -s, 0 $((TP_SIZE - 1)))" \
             --skip-before-generate
     ) | tee "$output_file"
 }
 
 main() {
-    require_path "$VLLM_DIR" "vLLM checkout"
+    require_path "$VLLM_PATCH_DIR/vllm" "vLLM hotpatch overlay"
+    require_path "$VLLM_PATCH_DIR/examples/managed_weight_sync/hf_push_ipc.py" \
+        "managed weight-sync IPC example"
     require_path "$PYTHON_BIN" "workspace python interpreter"
     require_path "$CHAT_MODEL_PATH" "chat model path"
     require_path "$BASE_MODEL_PATH" "base model path"

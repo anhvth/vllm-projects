@@ -386,6 +386,13 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     if hasattr(args, "subparser") and args.subparser != "serve":
         return
 
+    # The OpenAI API server accepts the model path as a positional
+    # ``model_tag`` argument, while the engine config reads ``args.model``.
+    # Keep the two in sync so a local path does not silently fall back to the
+    # dataclass default model.
+    if getattr(args, "model_tag", None):
+        args.model = args.model_tag
+
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
 
