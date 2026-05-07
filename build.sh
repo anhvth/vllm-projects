@@ -2,33 +2,37 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-VLLM_SRC="$REPO_ROOT/vllm"
 VENV_DIR="$REPO_ROOT/.venv"
+VLLM_PATCH_DIR="$REPO_ROOT/vllm_patch"
 
 echo "=== Step 0: Remove old venv ==="
-rm -rf "$VENV_DIR"
+if [ -d "$VENV_DIR" ]; then
+  rm -rf "$VENV_DIR"
+fi
 
 echo "=== Step 1: Create Python 3.12 venv ==="
 uv venv --python 3.12 "$VENV_DIR" --seed
 source "$VENV_DIR/bin/activate"
 
-echo "=== Step 2: Install torch with CUDA 12.9 ==="
-uv pip install torch==2.11.0+cu129 torchvision==0.26.0+cu129 torchaudio==2.11.0+cu129 \
-  --index-url https://download.pytorch.org/whl/cu129
+echo "=== Step 2: Install prebuilt vLLM wheel ==="
+uv pip install -U vllm --pre \
+  --extra-index-url https://wheels.vllm.ai/nightly/cu129 \
+  --extra-index-url https://download.pytorch.org/whl/cu129 \
+  --torch-backend=auto \
+  --index-strategy unsafe-best-match
 
-echo "=== Step 3: Install editable metadata dependencies ==="
-uv pip install \
-  "cmake>=3.26.1" \
-  ninja \
-  "packaging>=24.2" \
-  "setuptools>=77.0.3,<81.0.0" \
-  "setuptools-scm>=8.0" \
-  wheel \
-  jinja2
+echo "=== Step 3: Enable local vLLM hotpatch overlay ==="
+SITE_PACKAGES="$("$VENV_DIR/bin/python" - <<'PY'
+import sysconfig
 
-echo "=== Step 4: Install vLLM with precompiled binaries ==="
-VLLM_USE_PRECOMPILED=1 uv pip install -e "$VLLM_SRC" --torch-backend=auto --no-build-isolation
+print(sysconfig.get_paths()["purelib"])
+PY
+)"
+cat > "$SITE_PACKAGES/vllm_hotpatch.pth" <<EOF
+import sys; p = ${VLLM_PATCH_DIR@Q}; sys.path.remove(p) if p in sys.path else None; sys.path.insert(0, p)
+EOF
 
 echo ""
 echo "=== Done! ==="
+echo "Installed prebuilt vLLM and enabled local overlay at: $VLLM_PATCH_DIR/vllm"
 echo "Activate with: source $VENV_DIR/bin/activate"

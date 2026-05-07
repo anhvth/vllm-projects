@@ -1,5 +1,5 @@
 # Python venv
 .venv/
 
-# vllm is its own git repo — track separately
-vllm/
+# Full upstream vLLM checkout backup.
+vllm.bk/
