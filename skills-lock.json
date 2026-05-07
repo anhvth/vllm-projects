@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "vllm-managed-hotload": {
+      "source": "anhvth/vllm-projects",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/vllm-managed-hotload/SKILL.md",
+      "computedHash": "a2f57f517b9d0e04e2d55687509fd9ac50095cd4508237f361ed2dacb808a0ca"
+    }
+  }
+}
