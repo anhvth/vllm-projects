@@ -1,34 +1,82 @@
-# Agent Instructions for the Workspace
+# Agent Instructions for the PR Workspace
 
-> These instructions apply to the workspace root at `/home/anhvth8/vllm_projects`.
-> For the nested vLLM repo, also follow [vllm/AGENTS.md](vllm/AGENTS.md).
+> This file describes the active PR: managed weight-sync control endpoints for `vllm serve`.
 
-## Scope
+## Active PR
 
-- The root contains the workspace wrapper files such as [build.sh](build.sh) and [pyproject.toml](pyproject.toml).
-- The actual vLLM repository lives under [vllm/](vllm/).
-- Keep root guidance short and link to the nested repo instructions instead of duplicating them.
+- **Title:** Extend `vllm serve` with managed weight-sync control endpoints
+- **Feature branch:** `feature/managed-weight-sync-serve` in `vllm/`
+- **PR docs:** [`PR/hotload_vllm.md`](PR/hotload_vllm.md)
+- **E2E orchestration:** [`PR/run_hotload_vllm_e2e.sh`](PR/run_hotload_vllm_e2e.sh)
+
+## Workspace layout
+
+```
+/home/anhvth8/vllm_projects/
+├── .venv/                          # Shared Python venv (uv, Python 3.12)
+├── pyproject.toml                  # Build/project metadata (not in vllm/)
+├── vllm_patch/                     # Hotpatch overlay for managed weight-sync
+│   ├── vllm/entrypoints/openai/
+│   │   ├── managed_weight_sync.py  # Core managed endpoints (router)
+│   │   └── cli_args.py             # CLI flags: --managed-weight-sync, etc.
+│   └── examples/managed_weight_sync/
+│       └── hf_push_ipc.py          # IPC weight-push example client
+├── vllm/                           # Upstream vLLM git checkout (feature branch)
+├── PR/
+│   ├── hotload_vllm.md             # PR spec + implementation status
+│   ├── run_hotload_vllm_e2e.sh     # Full end-to-end acceptance test
+│   └── logs/                       # Artifacts from e2e runs
+├── build.sh                        # Bootstrap: create venv, install vllm, enable overlay
+├── CLAUDE.md                       # Workspace-level agent instructions
+└── AGENTS.md                       # This file
+```
+
+## Hotpatch overlay mechanism
+
+`build.sh` installs a `.pth` file into the site-packages that inserts `vllm_patch/` at the front of `sys.path`. This means files under `vllm_patch/vllm/` shadow the real `vllm/` package at runtime without modifying the upstream checkout.
+
+Implementation changes live in `vllm_patch/`, **not** in `vllm/`.
+
+## Key endpoints (managed weight-sync)
+
+All under prefix `/managed` (configurable via `--managed-weight-sync-prefix`):
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/managed/status` | Server status, config, sleep state |
+| GET | `/managed/world_size` | DP/TP world size |
+| POST | `/managed/pause` | Pause generation |
+| POST | `/managed/resume` | Resume generation |
+| POST | `/managed/sleep` | Offload weights (level 1) or discard (level 2) |
+| POST | `/managed/wake` | Restore weights/KV cache |
+| POST | `/managed/init_weight_transfer` | Init weight-transfer backend |
+| POST | `/managed/prepare_weight_update` | Convenience: pause + sleep + wake_weights |
+| POST | `/managed/finish_weight_update` | Convenience: wake_kv_cache + resume |
+
+## Development workflow
+
+- **Run the e2e test:** `bash PR/run_hotload_vllm_e2e.sh`
+- **Activate venv:** `source .venv/bin/activate`
+- **Run focused tests:**
+  ```bash
+  cd /home/anhvth8/vllm_projects
+  source .venv/bin/activate
+  cd vllm
+  python -m pytest tests/entrypoints/openai/test_managed_weight_sync.py -q
+  ```
+- **Lint with ruff:** `ruff check vllm_patch/ && ruff format --check vllm_patch/`
+- **Start dev server manually:**
+  ```bash
+  VLLM_SERVER_DEV_MODE=1 PYTHONPATH=/home/anhvth8/vllm_projects/vllm_patch \
+    /home/anhvth8/vllm_projects/.venv/bin/vllm serve ... --managed-weight-sync ...
+  ```
+
+## Safety
+
+Managed endpoints require `VLLM_SERVER_DEV_MODE=1` and must not be exposed to untrusted networks.
 
 ## Environment
 
-- Use `uv` for Python environment management.
-- Prefer Python 3.12 when creating or refreshing the virtual environment.
-- Use `.venv/bin/python` for checks and scripts instead of system `python3` or bare `pip`.
-
-## Practical Workflow
-
-- Use [build.sh](build.sh) when you need the scripted end-to-end workspace bootstrap.
-- For day-to-day vLLM development, follow the workflow in [vllm/AGENTS.md](vllm/AGENTS.md#2-development-workflow).
-- When changing `pyproject.toml`, treat it as the source of truth for Python version and build-tool constraints.
-
-## Build Strategy
-
-- `build.sh` uses `VLLM_USE_PRECOMPILED=1` to skip local CUDA kernel compilation.
-- This is sufficient when working on **Python-only logic** (model code, inference paths, sampling, etc.).
-- Only rebuild from source (remove `VLLM_USE_PRECOMPILED`) when touching C++/CUDA kernels, custom ops, or the CUDA extension layer.
-
-## Reference Docs
-
-- [vllm/README.md](vllm/README.md) for the project overview.
-- [vllm/docs/contributing/README.md](vllm/docs/contributing/README.md) for contributor guidance.
-- [vllm/docs/getting_started/installation/README.md](vllm/docs/getting_started/installation/README.md) for installation details.
+- Python venv at `.venv/` (Python 3.12, managed with `uv`)
+- All paths are relative to the workspace root unless absolute
+- For workspace-level bootstrap, see `build.sh`
