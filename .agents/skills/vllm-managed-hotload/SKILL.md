@@ -9,6 +9,48 @@ argument-hint: '[checkpoint path, model path, or task summary]'
 Use this skill when the user wants a persistent vLLM server that stays up while model weights change.
 In this workflow, "upload weights" means pushing an in-memory Transformers model into a running managed vLLM server with `examples/managed_weight_sync/hf_push_ipc.py`. It is not a file upload endpoint.
 
+Skill-owned helper scripts:
+
+- `./scripts/mangage_hotload_vllm.py`: Python helper that exposes a reusable `ManagedHotloadClient` for managed control endpoints and weight transfer, plus a small `ManagedHotloadDemo` subclass for starting and stopping the notebook demo server.
+- `./scripts/`: add this directory to `sys.path` before importing the helper.
+
+## Python Helper Usage
+
+If the user wants a notebook or a Python script instead of raw curl commands, import the helper from this skill folder.
+
+Notebook or script setup:
+
+```python
+import json
+import sys
+from pathlib import Path
+
+SKILL_SCRIPTS_DIR = Path('/home/anhvth8/vllm_projects/.agents/skills/vllm-managed-hotload/scripts')
+if str(SKILL_SCRIPTS_DIR) not in sys.path:
+  sys.path.insert(0, str(SKILL_SCRIPTS_DIR))
+
+from mangage_hotload_vllm import demo, describe_demo_config
+
+print(json.dumps(describe_demo_config(), indent=2))
+```
+
+Typical helper calls:
+
+```python
+demo.start_dummy_service()
+demo.pause()
+demo.sleep(level=1)
+demo.wake(tags=['weights', 'kv_cache'])
+demo.resume()
+demo.stop()
+```
+
+Use `demo.push(model)` when the caller already has an in-memory module with `named_parameters()` and wants to transfer it directly from the current Python process.
+
+For model swaps from notebook code, call `demo.push(model)` after loading the model in the notebook kernel. Keep completion and chat requests in the notebook, not in the helper.
+
+Implement `/v1/completions` and `/v1/chat/completions` calls in the notebook or calling script by using `demo.post_json(...)` or another OpenAI-compatible client. Keep the helper focused on managed control and weight transfer.
+
 ## When to Use
 
 - Host `vllm serve` in `tmux` and keep the process alive
@@ -239,6 +281,6 @@ Do not claim success until these are true:
 
 ## Related Files in This Workspace
 
-- `PR/run_hotload_vllm_e2e.sh`
+- `.agents/skills/vllm-managed-hotload/scripts/mangage_hotload_vllm.py`
 - `PR/hotload_vllm.md`
-- `vllm/examples/managed_weight_sync/hf_push_ipc.py`
+- `vllm_patch/examples/managed_weight_sync/hf_push_ipc.py`
