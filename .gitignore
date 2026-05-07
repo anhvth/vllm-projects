@@ -3,3 +3,29 @@
 
 # Full upstream vLLM checkout backup.
 vllm.bk/
+
+# Python __pycache__
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+logs/
+*.log
+
+# Build / dist
+*.egg-info/
+dist/
+build/
+*.egg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PR working directories
+PR/logs/
+
+# IDE
+.vscode/
+.idea/
