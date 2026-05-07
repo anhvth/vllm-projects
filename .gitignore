@@ -1,5 +1,5 @@
-# vLLM is its own git repo — tracked separately
-vllm/
-
 # Python venv
 .venv/
+
+# vllm is its own git repo — track separately
+vllm/
