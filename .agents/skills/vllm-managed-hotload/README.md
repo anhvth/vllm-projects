@@ -5,7 +5,7 @@ A Claude Code skill for hosting a long-lived vLLM serve process with managed wei
 ## Install
 
 ```bash
-npx skills add anhvth8/vllm-managed-hotload-skill
+npx skills add anhvth/vllm-projects
 ```
 
 ## Usage
