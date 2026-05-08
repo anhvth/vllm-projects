@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import requests
@@ -20,7 +20,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from vllm_hotload.hotloadctl import ClusterState, ReplicaState, collect_cluster_status, main
+from vllm_hotload.hotloadctl import (
+    ClusterState,
+    ReplicaState,
+    collect_cluster_status,
+    main,
+)
+from vllm_hotload.ray_vllm import main as ray_vllm_main
 from vllm_hotload.proxy import create_app
 
 
@@ -78,7 +84,10 @@ class HotloadCtlTests(unittest.TestCase):
         self.assertEqual(public_apps[0]["route_prefix"], "/")
         self.assertEqual(len(replica_apps), 3)
         self.assertTrue(
-            all(app["route_prefix"].startswith("/_hotloadctl/replicas/") for app in replica_apps)
+            all(
+                app["route_prefix"].startswith("/_hotloadctl/replicas/")
+                for app in replica_apps
+            )
         )
         self.assertTrue(
             all(
@@ -92,15 +101,70 @@ class HotloadCtlTests(unittest.TestCase):
                 for app in replica_apps
             )
         )
+        self.assertFalse(replica_apps[0]["args"]["fast_loading_ram"])
+
+    def test_ray_vllm_serve_dry_run_maps_vllm_like_args_and_ram_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("sys.stdout.write") as write_mock:
+                ray_vllm_main(
+                    [
+                        "serve",
+                        "/models/qwen3",
+                        "--nodes",
+                        "node0,node1",
+                        "--tensor-parallel-size",
+                        "4",
+                        "--served-model-name",
+                        "qwen3-1.7b",
+                        "--port",
+                        "9000",
+                        "--public-host",
+                        "head-node",
+                        "--workspace-dir",
+                        tmpdir,
+                        "--state-file",
+                        str(Path(tmpdir) / "state.json"),
+                        "--trust-remote-code",
+                        "--fast-loading",
+                        "ram",
+                        "--ram-stage-num-workers",
+                        "3",
+                        "--dry-run",
+                    ]
+                )
+            payload = json.loads(
+                "".join(call.args[0] for call in write_mock.call_args_list)
+            )
+
+        replica_apps = [
+            app
+            for app in payload["serve_config"]["applications"]
+            if app["import_path"] == "vllm_hotload.ray_serve_app:build_vllm_replica_app"
+        ]
+
+        self.assertEqual(payload["public_base_url"], "http://head-node:9000/v1")
+        self.assertEqual(len(replica_apps), 2)
+        self.assertEqual(
+            replica_apps[0]["deployments"][0]["ray_actor_options"]["num_gpus"],
+            4,
+        )
+        self.assertTrue(replica_apps[0]["args"]["fast_loading_ram"])
+        self.assertEqual(replica_apps[0]["args"]["ram_stage_num_workers"], 3)
+        self.assertTrue(replica_apps[0]["args"]["trust_remote_code"])
 
     def test_start_preflight_surfaces_version_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch(
-                "vllm_hotload.hotloadctl._run_cli",
-                side_effect=RuntimeError(
-                    "ray status failed due to a Ray version mismatch.\ncluster=2.55.1 local=2.54.0"
+            with (
+                patch(
+                    "vllm_hotload.hotloadctl._run_cli",
+                    side_effect=RuntimeError(
+                        "ray status failed due to a Ray version mismatch.\ncluster=2.55.1 local=2.54.0"
+                    ),
                 ),
-            ), patch("vllm_hotload.hotloadctl.write_serve_config") as write_config_mock:
+                patch(
+                    "vllm_hotload.hotloadctl.write_serve_config"
+                ) as write_config_mock,
+            ):
                 with self.assertRaisesRegex(RuntimeError, "version mismatch"):
                     main(
                         [
@@ -137,6 +201,10 @@ class HotloadCtlTests(unittest.TestCase):
             served_model_name="qwen3-1.7b",
             start_model_path="/models/dummy",
             gpus_per_replica=2,
+            fast_loading_ram=False,
+            ram_stage_num_workers=8,
+            ram_stage_copy_delay=0.0,
+            ram_stage_small_file_threshold=10_000_000,
             nodes=["node0", "node1"],
             replicas=[
                 ReplicaState(
@@ -175,19 +243,25 @@ class HotloadCtlTests(unittest.TestCase):
 
         def fake_request(method: str, url: str, json: object, timeout: float):
             del method, json, timeout
-            if url == "http://head-node:8000/_hotloadctl/replicas/1-node0/managed/status":
+            if (
+                url
+                == "http://head-node:8000/_hotloadctl/replicas/1-node0/managed/status"
+            ):
                 return FakeResponse({"sleeping": False, "model": "qwen3-1.7b"})
             if url == "http://head-node:8000/_hotloadctl/replicas/1-node0/v1/models":
                 return FakeResponse({"data": [{"id": "qwen3-1.7b"}]})
             raise requests.RequestException("node1 down")
 
-        with patch("requests.request", side_effect=fake_request), patch(
-            "vllm_hotload.hotloadctl._serve_status",
-            return_value={
-                "applications": {
-                    "vllm-hotload-public": {"status": "RUNNING", "message": ""}
-                }
-            },
+        with (
+            patch("requests.request", side_effect=fake_request),
+            patch(
+                "vllm_hotload.hotloadctl._serve_status",
+                return_value={
+                    "applications": {
+                        "vllm-hotload-public": {"status": "RUNNING", "message": ""}
+                    }
+                },
+            ),
         ):
             status = collect_cluster_status(state, 5.0)
 
@@ -196,7 +270,9 @@ class HotloadCtlTests(unittest.TestCase):
         self.assertEqual(status["replicas"][0]["managed_status"]["model"], "qwen3-1.7b")
         self.assertEqual(status["replicas"][1]["health"], "unhealthy")
         self.assertIsNone(status["replicas"][1]["managed_status"])
-        self.assertEqual(status["serve_applications"]["vllm-hotload-public"]["status"], "RUNNING")
+        self.assertEqual(
+            status["serve_applications"]["vllm-hotload-public"]["status"], "RUNNING"
+        )
 
     def test_push_dry_run_uses_replica_route_prefix_managed_urls(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -217,6 +293,10 @@ class HotloadCtlTests(unittest.TestCase):
                         "served_model_name": "qwen3-1.7b",
                         "start_model_path": "/models/dummy",
                         "gpus_per_replica": 2,
+                        "fast_loading_ram": True,
+                        "ram_stage_num_workers": 5,
+                        "ram_stage_copy_delay": 0.25,
+                        "ram_stage_small_file_threshold": 1024,
                         "nodes": ["node0"],
                         "replicas": [
                             {
@@ -253,6 +333,19 @@ class HotloadCtlTests(unittest.TestCase):
         self.assertEqual(
             payload["operations"][0]["load_weights"]["url"],
             "http://head-node:8000/_hotloadctl/replicas/1-node0/managed/load_weights",
+        )
+        self.assertEqual(
+            payload["operations"][0]["load_weights"]["payload"],
+            {
+                "model_path": "/checkpoints/step-100",
+                "load_format": "safetensors",
+                "safetensors_load_strategy": "ram_stage",
+                "model_loader_extra_config": {
+                    "ram_stage_num_workers": 5,
+                    "ram_stage_copy_delay": 0.25,
+                    "ram_stage_small_file_threshold": 1024,
+                },
+            },
         )
         self.assertNotIn("push_command", payload["operations"][0])
 

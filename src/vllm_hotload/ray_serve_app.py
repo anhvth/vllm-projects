@@ -49,6 +49,10 @@ def build_vllm_replica_app(
     max_model_len: int = 4096,
     route_prefix: str = "/",
     trust_remote_code: bool = False,
+    fast_loading_ram: bool = False,
+    ram_stage_num_workers: int = 8,
+    ram_stage_copy_delay: float = 0.0,
+    ram_stage_small_file_threshold: int = 10_000_000,
 ) -> Application:
     argv = [
         model_path,
@@ -73,6 +77,23 @@ def build_vllm_replica_app(
     ]
     if trust_remote_code:
         argv.append("--trust-remote-code")
+    if fast_loading_ram:
+        argv.extend(
+            [
+                "--safetensors-load-strategy",
+                "ram_stage",
+                "--model-loader-extra-config",
+                json.dumps(
+                    {
+                        "ram_stage_num_workers": ram_stage_num_workers,
+                        "ram_stage_copy_delay": ram_stage_copy_delay,
+                        "ram_stage_small_file_threshold": (
+                            ram_stage_small_file_threshold
+                        ),
+                    }
+                ),
+            ]
+        )
 
     app = api_server.build_app(_parse_vllm_serve_args(argv))
     return _bind_fastapi_app(app, DEFAULT_REPLICA_DEPLOYMENT_NAME)

@@ -70,6 +70,10 @@ class ClusterState:
     served_model_name: str
     start_model_path: str
     gpus_per_replica: int
+    fast_loading_ram: bool
+    ram_stage_num_workers: int
+    ram_stage_copy_delay: float
+    ram_stage_small_file_threshold: int
     nodes: list[str]
     replicas: list[ReplicaState]
 
@@ -93,7 +97,9 @@ def _slugify(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9-]+", "-", value).strip("-").lower()
 
 
-def _build_replica_urls(host: str, port: int, route_prefix: str) -> tuple[str, str, str]:
+def _build_replica_urls(
+    host: str, port: int, route_prefix: str
+) -> tuple[str, str, str]:
     base_url = f"http://{host}:{port}{route_prefix}"
     return base_url, f"{base_url}/v1", f"{base_url}/managed"
 
@@ -137,6 +143,10 @@ def build_cluster_state(args: argparse.Namespace) -> ClusterState:
         served_model_name=args.served_model_name,
         start_model_path=str(Path(args.model_path).expanduser()),
         gpus_per_replica=args.gpus_per_replica,
+        fast_loading_ram=args.fast_loading_ram,
+        ram_stage_num_workers=args.ram_stage_num_workers,
+        ram_stage_copy_delay=args.ram_stage_copy_delay,
+        ram_stage_small_file_threshold=args.ram_stage_small_file_threshold,
         nodes=[replica.node for replica in replicas],
         replicas=replicas,
     )
@@ -172,6 +182,13 @@ def load_state(state_file: Path) -> ClusterState:
         served_model_name=data["served_model_name"],
         start_model_path=data["start_model_path"],
         gpus_per_replica=data["gpus_per_replica"],
+        fast_loading_ram=data.get("fast_loading_ram", False),
+        ram_stage_num_workers=data.get("ram_stage_num_workers", 8),
+        ram_stage_copy_delay=data.get("ram_stage_copy_delay", 0.0),
+        ram_stage_small_file_threshold=data.get(
+            "ram_stage_small_file_threshold",
+            10_000_000,
+        ),
         nodes=data["nodes"],
         replicas=[
             ReplicaState(
@@ -349,7 +366,9 @@ def _node_resource_key(node: str, strict: bool) -> str:
         return f"node:{resolve_node_ip(node)}"
     except socket.gaierror as exc:
         if strict:
-            raise ValueError(f"Unable to resolve node '{node}' to an IP address.") from exc
+            raise ValueError(
+                f"Unable to resolve node '{node}' to an IP address."
+            ) from exc
         return f"node:{node}"
 
 
@@ -409,6 +428,12 @@ def build_serve_config(
                     "max_model_len": args.max_model_len,
                     "route_prefix": replica.route_prefix,
                     "trust_remote_code": args.trust_remote_code,
+                    "fast_loading_ram": state.fast_loading_ram,
+                    "ram_stage_num_workers": state.ram_stage_num_workers,
+                    "ram_stage_copy_delay": state.ram_stage_copy_delay,
+                    "ram_stage_small_file_threshold": (
+                        state.ram_stage_small_file_threshold
+                    ),
                 },
                 "deployments": [
                     {
@@ -473,7 +498,10 @@ def wait_for_serve_apps(
             continue
 
         applications = status.get("applications") or {}
-        if all(applications.get(name, {}).get("status") == "RUNNING" for name in owned_app_names):
+        if all(
+            applications.get(name, {}).get("status") == "RUNNING"
+            for name in owned_app_names
+        ):
             return
 
         failed = {
@@ -483,8 +511,7 @@ def wait_for_serve_apps(
         }
         if failed:
             raise RuntimeError(
-                "Serve reported a deployment failure for: "
-                + ", ".join(sorted(failed))
+                "Serve reported a deployment failure for: " + ", ".join(sorted(failed))
             )
 
         time.sleep(2)
@@ -530,7 +557,9 @@ def wait_for_public_proxy(
     deadline = time.time() + timeout_secs
     while time.time() < deadline:
         try:
-            request_json("GET", f"{state.public_base_url}/models", None, request_timeout)
+            request_json(
+                "GET", f"{state.public_base_url}/models", None, request_timeout
+            )
             return
         except _requests_exc()[0]:
             time.sleep(2)
@@ -598,6 +627,21 @@ def emit_json(payload: Any) -> None:
     sys.stdout.write("\n")
 
 
+def build_load_weights_payload(state: ClusterState, checkpoint: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model_path": checkpoint,
+        "load_format": DEFAULT_SERVER_LOAD_FORMAT,
+    }
+    if state.fast_loading_ram:
+        payload["safetensors_load_strategy"] = "ram_stage"
+        payload["model_loader_extra_config"] = {
+            "ram_stage_num_workers": state.ram_stage_num_workers,
+            "ram_stage_copy_delay": state.ram_stage_copy_delay,
+            "ram_stage_small_file_threshold": state.ram_stage_small_file_threshold,
+        }
+    return payload
+
+
 def start_command(args: argparse.Namespace) -> None:
     state = build_cluster_state(args)
     state_file = Path(args.state_file).resolve()
@@ -648,10 +692,7 @@ def push_command(args: argparse.Namespace) -> None:
                 },
                 "load_weights": {
                     "url": f"{replica.managed_url}/load_weights",
-                    "payload": {
-                        "model_path": checkpoint,
-                        "load_format": DEFAULT_SERVER_LOAD_FORMAT,
-                    },
+                    "payload": build_load_weights_payload(state, checkpoint),
                 },
                 "finish_weight_update": {
                     "url": f"{replica.managed_url}/finish_weight_update",
@@ -682,10 +723,7 @@ def push_command(args: argparse.Namespace) -> None:
         load_result = request_json(
             "POST",
             f"{replica.managed_url}/load_weights",
-            {
-                "model_path": checkpoint,
-                "load_format": DEFAULT_SERVER_LOAD_FORMAT,
-            },
+            build_load_weights_payload(state, checkpoint),
             args.request_timeout,
         )
         finish_result = request_json(
@@ -828,6 +866,10 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--gpu-memory-utilization", type=float, default=0.40)
     start.add_argument("--max-model-len", type=int, default=4096)
     start.add_argument("--trust-remote-code", action="store_true")
+    start.add_argument("--fast-loading-ram", action="store_true")
+    start.add_argument("--ram-stage-num-workers", type=int, default=8)
+    start.add_argument("--ram-stage-copy-delay", type=float, default=0.0)
+    start.add_argument("--ram-stage-small-file-threshold", type=int, default=10_000_000)
     start.add_argument("--ray-address", default="auto")
     start.add_argument("--dashboard-address", default=DEFAULT_DASHBOARD_ADDRESS)
     start.add_argument("--ready-timeout-secs", type=int, default=600)
@@ -893,7 +935,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     stop = subparsers.add_parser(
-        "stop", help="Shutdown the owned Ray Serve applications for this hotload cluster."
+        "stop",
+        help="Shutdown the owned Ray Serve applications for this hotload cluster.",
     )
     stop.add_argument("--state-file")
     stop.add_argument("--dry-run", action="store_true")
