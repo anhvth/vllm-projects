@@ -6,45 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "vllm-hotload-workspace"
 version = "0.1.0"
 requires-python = "==3.12.*"
-dependencies = [
-  "vllm @ https://wheels.vllm.ai/2a16ece2d342c0c154a4949ad317b521f8c04ec4/vllm-0.20.2rc1.dev107%2Bg2a16ece2d.cu129-cp38-abi3-manylinux_2_34_x86_64.whl",
-  "torch==2.11.0+cu129",
-  "torchaudio==2.11.0+cu129",
-  "torchvision==0.26.0+cu129",
-  "triton==3.6.0",
-  "jupyterlab>=4.6.0a5",
-]
+dependencies = []
 
 [project.scripts]
 hotloadctl = "vllm_hotload.hotloadctl:main"
 vllm-hotload-hf-push-ipc = "vllm_hotload.hf_push_ipc:main"
 
-[tool.uv]
-package = true
-prerelease = "allow"
-index-strategy = "unsafe-best-match"
-environments = ["sys_platform == 'linux'"]
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu129" }
-torchaudio = { index = "pytorch-cu129" }
-torchvision = { index = "pytorch-cu129" }
-
 [tool.setuptools.packages.find]
 where = ["src", "vllm_patch"]
 include = ["vllm_hotload*", "vllm", "vllm.*"]
-
-[dependency-groups]
-dev = [
-    "pyright>=1.1.409",
-]
-
-[[tool.uv.index]]
-name = "vllm-nightly-cu129"
-url = "https://wheels.vllm.ai/nightly/cu129"
-explicit = false
-
-[[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = false

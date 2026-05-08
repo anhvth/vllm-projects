@@ -32,5 +32,11 @@ PR/logs/
 
 # Cache
 .cache/
+
+# Auto-generated lockfile
+requirements_lock.txt
+
+# Pre-downloaded wheels (large binaries)
+wheels/
 .chainlit
 .hotloadctl/state.json
