@@ -485,6 +485,37 @@ async def prepare_weight_update(raw_request: Request) -> JSONResponse:
         )
 
 
+@router.post("/load_weights")
+async def load_weights(raw_request: Request) -> JSONResponse:
+    try:
+        _ensure_weight_transfer_configured(raw_request)
+        body = await _read_json_body(raw_request)
+
+        model_path = body.get("model_path")
+        if not model_path or not isinstance(model_path, str):
+            raise ManagedWeightSyncError(
+                HTTPStatus.BAD_REQUEST,
+                "Missing or invalid 'model_path'.",
+                "Send {'model_path': '/path/to/checkpoint'}.",
+            )
+
+        kwargs = {
+            "model_path": model_path,
+            "load_format": body.get("load_format", "safetensors"),
+            "safetensors_load_strategy": body.get(
+                "safetensors_load_strategy"
+            ),
+            "model_loader_extra_config": body.get("model_loader_extra_config"),
+        }
+
+        await _engine_client(raw_request).load_weights_from_path(kwargs)
+        return _ok_response({"model_path": model_path})
+    except ManagedWeightSyncError as err:
+        return _expected_error_response(err)
+    except Exception as err:
+        return _unexpected_error_response("load_weights", err)
+
+
 @router.post("/finish_weight_update")
 async def finish_weight_update(raw_request: Request) -> JSONResponse:
     steps: list[dict[str, Any]] = []

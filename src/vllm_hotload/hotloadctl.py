@@ -227,30 +227,32 @@ def build_push_helper_command(
     args: argparse.Namespace,
 ) -> str:
     target_devices = ",".join(str(index) for index in replica.gpu_devices)
-    helper_command = shell_join(
-        [
-            "uv",
-            "run",
-            "--directory",
-            state.workspace_dir,
-            "vllm-hotload-hf-push-ipc",
-            "--model-path",
-            checkpoint,
-            "--base-url",
-            f"http://127.0.0.1:{state.base_port}",
-            "--served-model-name",
-            state.served_model_name,
-            "--target-devices",
-            target_devices,
-            "--dtype",
-            args.dtype,
-            "--skip-before-generate",
-            "--skip-after-generate",
-            "--skip-init-weight-transfer",
-            "--skip-prepare-weight-update",
-            "--skip-finish-weight-update",
-        ]
-    )
+    helper_parts = [
+        "uv",
+        "run",
+        "--directory",
+        state.workspace_dir,
+        "vllm-hotload-hf-push-ipc",
+        "--model-path",
+        checkpoint,
+        "--base-url",
+        f"http://127.0.0.1:{state.base_port}",
+        "--served-model-name",
+        state.served_model_name,
+        "--dtype",
+        args.dtype,
+        "--skip-before-generate",
+        "--skip-after-generate",
+        "--skip-init-weight-transfer",
+        "--skip-prepare-weight-update",
+        "--skip-finish-weight-update",
+    ]
+    if args.server_side_load:
+        helper_parts.append("--server-side-load")
+    else:
+        helper_parts.extend(["--target-devices", target_devices])
+
+    helper_command = shell_join(helper_parts)
     inner = (
         f"cd {shlex.quote(state.workspace_dir)} && "
         "export VLLM_ALLOW_INSECURE_SERIALIZATION=1 && "
@@ -588,6 +590,14 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT)
     push.add_argument("--dry-run", action="store_true")
     push.add_argument("--echo-commands", action="store_true")
+    push.add_argument(
+        "--server-side-load",
+        action="store_true",
+        help=(
+            "Delegate weight loading to the vLLM server. The server reads "
+            "the checkpoint directly from disk using its RamStageManager."
+        ),
+    )
     push.set_defaults(handler=push_command)
 
     status = subparsers.add_parser("status", help="Show public and per-replica status.")
