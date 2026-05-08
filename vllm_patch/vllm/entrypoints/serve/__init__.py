@@ -61,6 +61,6 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_managed_weight_sync_router(app)
 
-    from .instrumentator import register_instrumentator_api_routers
+    from .instrumentator import register_instrumentator_api_routers  # pyright: ignore[reportMissingImports]
 
     register_instrumentator_api_routers(app)

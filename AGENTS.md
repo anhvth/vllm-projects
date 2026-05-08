@@ -33,7 +33,11 @@
 
 ## Hotpatch overlay mechanism
 
-`build.sh` installs a `.pth` file into the site-packages that inserts `vllm_patch/` at the front of `sys.path`. This means files under `vllm_patch/vllm/` shadow the real `vllm/` package at runtime without modifying the upstream checkout.
+`build.sh` runs `uv sync` for this workspace, which installs the local project
+defined by `pyproject.toml`. That local package exposes the files under
+`vllm_patch/vllm/` as an installed overlay so they shadow the upstream `vllm`
+package at runtime without requiring manual `PYTHONPATH` or custom `.pth`
+injection.
 
 Implementation changes live in `vllm_patch/`, **not** in `vllm/`.
 
@@ -65,10 +69,10 @@ All under prefix `/managed` (configurable via `--managed-weight-sync-prefix`):
   python -m pytest tests/entrypoints/openai/test_managed_weight_sync.py -q
   ```
 - **Lint with ruff:** `ruff check vllm_patch/ && ruff format --check vllm_patch/`
+- **Lint with pyright (filters overlay noise):** `uv run python tools/lint.py` or `uv run python tools/lint.py --file <path>`
 - **Start dev server manually:**
   ```bash
-  VLLM_SERVER_DEV_MODE=1 PYTHONPATH=/home/anhvth8/vllm_projects/vllm_patch \
-    /home/anhvth8/vllm_projects/.venv/bin/vllm serve ... --managed-weight-sync ...
+  VLLM_SERVER_DEV_MODE=1 uv run vllm serve ... --managed-weight-sync ...
   ```
 
 ## Safety

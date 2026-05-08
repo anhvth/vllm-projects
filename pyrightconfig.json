@@ -1,3 +1,24 @@
 {
-    "exclude": ["**/*.ipynb"]
+    "include": [
+        ".agents/skills/vllm-managed-hotload/scripts",
+        "vllm_patch"
+    ],
+    "exclude": [
+        "**/*.ipynb",
+        "**/node_modules",
+        "**/__pycache__",
+        "**/.*",
+        ".git",
+        ".venv/**"
+    ],
+    "extraPaths": [
+        ".agents/skills/vllm-managed-hotload/scripts",
+        "vllm_patch"
+    ],
+    "typeCheckingMode": "standard",
+    "diagnosticSeverityOverrides": {
+        "reportMissingImports": "information",
+        "reportMissingTypeStubs": "none",
+        "reportUndefinedVariable": "none"
+    }
 }

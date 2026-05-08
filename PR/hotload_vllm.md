@@ -234,7 +234,7 @@ The final UX should look like:
 ```bash
 VLLM_SERVER_DEV_MODE=1 \
 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-/home/anhvth8/vllm_projects/.venv/bin/vllm serve ~/ckpt/hf_models/Qwen/Qwen3-1.7B/ \
+uv run vllm serve ~/ckpt/hf_models/Qwen/Qwen3-1.7B/ \
   --served-model-name qwen3-1.7b \
   --trust-remote-code \
   --dtype bfloat16 \
@@ -262,6 +262,202 @@ curl -X POST http://127.0.0.1:8000/managed/finish_weight_update \
   -H 'Content-Type: application/json' \
   -d '{"wake_kv_cache": true, "resume": true}'
 ```
+
+## Multi-node serving decision
+
+Decision: one served model replica must fit on one physical node. We do not
+support splitting a single model replica across nodes for managed hotload.
+
+For a 3-node, 8-GPU-per-node cluster, the managed service should run as up to
+three independent vLLM replicas:
+
+```text
+node0: one dummy -> hotload vLLM replica using local GPUs 0..7
+node1: one dummy -> hotload vLLM replica using local GPUs 0..7
+node2: one dummy -> hotload vLLM replica using local GPUs 0..7
+```
+
+This keeps the weight-transfer path local to each machine. The current IPC
+hotload mechanism remains a good fit because CUDA IPC handles are
+single-machine objects. Cross-node Ray is still useful for cluster lifecycle
+and placement, but it should not be used to create one model replica spread
+across multiple machines.
+
+User-facing goal:
+
+```text
+hotloadctl start --nodes node0,node1,node2 --gpus-per-replica 8
+hotloadctl push /path/to/checkpoint
+hotloadctl status
+hotloadctl sleep
+hotloadctl wake
+hotloadctl stop
+```
+
+The controller handles per-node details. Users should not need to manually run
+three different `vllm serve` commands, remember ports, or call every managed
+endpoint themselves.
+
+### Public OpenAI endpoint
+
+Application code should see one OpenAI-compatible base URL, not one URL per
+replica:
+
+```text
+public OpenAI base URL: http://head-node:8000/v1
+```
+
+The public endpoint is backed by a small proxy/load balancer that routes normal
+OpenAI-compatible requests to healthy per-node vLLM replicas:
+
+```text
+node0 replica: http://node0:8100/v1
+node1 replica: http://node1:8100/v1
+node2 replica: http://node2:8100/v1
+```
+
+Client usage stays ordinary:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://head-node:8000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="qwen3-1.7b",
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+Managed control remains private and per-replica:
+
+```text
+node0 control: http://node0:8100/managed
+node1 control: http://node1:8100/managed
+node2 control: http://node2:8100/managed
+```
+
+Only the controller should call the managed URLs. Regular inference clients
+should use the single public `/v1` endpoint.
+
+`hotloadctl status` should show both views:
+
+```text
+public_base_url: http://head-node:8000/v1
+
+replicas:
+  node0: http://node0:8100/v1 healthy
+  node1: http://node1:8100/v1 healthy
+  node2: http://node2:8100/v1 healthy
+```
+
+Recommended internal shape:
+
+```text
+hotloadctl start
+  -> ssh each node if needed
+  -> optionally start/join a dedicated Ray cluster on non-default ports
+  -> start one vLLM dummy replica per selected node
+  -> wait for /managed/status and /v1/models on every replica
+
+hotloadctl push CHECKPOINT
+  -> for each replica:
+       POST /managed/init_weight_transfer
+       POST /managed/prepare_weight_update
+       run local IPC weight push on that replica's node
+       POST /managed/finish_weight_update
+  -> verify /v1/chat/completions or /v1/completions on every replica
+
+hotloadctl status
+  -> return one combined view across replicas
+```
+
+Suggested first implementation: use SSH/tmux for process launch because it is
+already proven in this workspace, and keep the command surface compatible with
+Ray so the launcher can later replace raw process management with Ray actors.
+Ray should use non-default ports to avoid conflicts with training jobs.
+
+The important product boundary is that users think in terms of a hotloadable
+replica group, while the system maintains multiple per-node vLLM servers under
+the hood.
+
+### Why not split one model across nodes?
+
+Cross-node model parallelism makes the hotload transport much harder and less
+reliable for this PR:
+
+* The existing IPC push helper is machine-local.
+* A true multi-node transfer would need one transfer worker per node plus extra
+  coordination to map parameters to distributed ranks.
+* Tensor/pipeline parallelism across machines increases operational coupling
+  and makes failures harder to recover from.
+* The target deployment has 8 GPUs per node, which is a natural boundary for
+  one vLLM replica.
+
+If a future model cannot fit inside one 8-GPU node, that should be treated as a
+separate feature: multi-node model-parallel hotload with a different transfer
+design, not a small extension of the current IPC path.
+
+## Superseded multi-node notes
+
+The notes below are kept as background only. They are not the chosen product
+direction for this PR because they imply one served model may be split across
+nodes.
+
+### Layer 1: Ray cluster bootstrap
+
+Keep SSH only for first contact and cluster bring-up. A small launcher can
+start Ray on the head node, join the worker nodes, and wait until the full set
+of GPUs is visible before any serving process starts.
+
+One reasonable shape is:
+
+```text
+hotloadctl cluster start
+  -> ssh node0: ray start --head --port 26379 ...
+  -> ssh node1: ray start --address node0:26379 ...
+  -> ssh node2: ray start --address node0:26379 ...
+  -> ray status until 3 nodes / 24 GPUs alive
+```
+
+Using a non-default Ray port is preferable when these hosts may also run other
+Ray jobs. The exact port set can be adjusted to avoid collisions with existing
+training clusters.
+
+### Layer 2: Dummy vLLM service
+
+Once the Ray cluster is healthy, run one hosted dummy vLLM server on the Ray
+head node with managed weight-sync enabled. For a 3-node, 8-GPU-per-node
+cluster, the likely starting point is TP=8 and PP=3 so tensor parallel stays
+mostly within each node while pipeline parallel spans nodes.
+
+The resulting service model is:
+
+```text
+SSH bootstraps Ray/processes
+Ray owns distributed membership and resource scheduling
+vLLM serves the dummy model first
+managed endpoints pause / sleep / wake / resume generation
+an external controller pushes real weights into the live service
+```
+
+### Important transport limitation
+
+The current IPC-based hotload helper is a strong fit for single-node weight
+pushes, but CUDA IPC handles are local-machine objects. That means the existing
+`hf_push_ipc.py` path is not enough by itself for a true 3-node engine.
+
+Two practical follow-on options are:
+
+1. Keep the scope minimal and run 3 independent 8-GPU vLLM servers, one per
+   node, then load-balance across them. This reuses the current IPC hotload
+   path with almost no new transport work.
+2. Build a true multi-node weight-push helper that coordinates one local
+   transfer worker per node, then drives the managed prepare/update/finish
+   flow across the whole 24-GPU engine.
+
+For a first production pass, the minimal option is the safer choice unless the
+target model genuinely needs all 24 GPUs as one serving engine.
 
 ## 1. Clone source and prepare branch
 
@@ -906,7 +1102,7 @@ Server:
 ```bash
 VLLM_SERVER_DEV_MODE=1 \
 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-/home/anhvth8/vllm_projects/.venv/bin/vllm serve ~/ckpt/hf_models/Qwen/Qwen3-1.7B/ \
+uv run vllm serve ~/ckpt/hf_models/Qwen/Qwen3-1.7B/ \
   --served-model-name qwen3-1.7b \
   --trust-remote-code \
   --dtype bfloat16 \
@@ -1019,7 +1215,7 @@ Run server:
 ```bash
 VLLM_SERVER_DEV_MODE=1 \
 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-/home/anhvth8/vllm_projects/.venv/bin/vllm serve ~/ckpt/hf_models/Qwen/Qwen3-1.7B/ \
+uv run vllm serve ~/ckpt/hf_models/Qwen/Qwen3-1.7B/ \
   --served-model-name qwen3-1.7b \
   --trust-remote-code \
   --dtype bfloat16 \

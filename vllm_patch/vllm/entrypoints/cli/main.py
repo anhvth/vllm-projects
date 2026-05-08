@@ -15,22 +15,22 @@ logger = init_logger(__name__)
 
 
 def main():
-    import vllm.entrypoints.cli.benchmark.main
-    import vllm.entrypoints.cli.collect_env
-    import vllm.entrypoints.cli.launch
-    import vllm.entrypoints.cli.openai
-    import vllm.entrypoints.cli.run_batch
-    import vllm.entrypoints.cli.serve
+    import vllm.entrypoints.cli.benchmark.main as benchmark_main
+    import vllm.entrypoints.cli.collect_env as collect_env
+    import vllm.entrypoints.cli.launch as launch
+    import vllm.entrypoints.cli.openai as openai
+    import vllm.entrypoints.cli.run_batch as run_batch
+    import vllm.entrypoints.cli.serve as serve
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     CMD_MODULES = [
-        vllm.entrypoints.cli.openai,
-        vllm.entrypoints.cli.serve,
-        vllm.entrypoints.cli.launch,
-        vllm.entrypoints.cli.benchmark.main,
-        vllm.entrypoints.cli.collect_env,
-        vllm.entrypoints.cli.run_batch,
+        openai,
+        serve,
+        launch,
+        benchmark_main,
+        collect_env,
+        run_batch,
     ]
 
     cli_env_setup()
@@ -46,7 +46,7 @@ def main():
             )
             sys.exit(1)
 
-        from vllm_omni.entrypoints.cli.main import main as omni_main
+        from vllm_omni.entrypoints.cli.main import main as omni_main  # pyright: ignore[reportMissingImports]
 
         logger.info("Delegating entrypoint handling to vllm-omni")
         omni_main()
@@ -57,7 +57,7 @@ def main():
                 "Bench command detected, must ensure current platform is not "
                 "UnspecifiedPlatform to avoid device type inference error"
             )
-            from vllm import platforms
+            import vllm.platforms as platforms
 
             if platforms.current_platform.is_unspecified():
                 from vllm.platforms.cpu import CpuPlatform
@@ -85,11 +85,13 @@ def main():
                 cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
                 cmds[cmd.name] = cmd
         args = parser.parse_args()
-        if args.subparser in cmds:
-            cmds[args.subparser].validate(args)
+        subparser = getattr(args, "subparser", None)
+        if subparser in cmds:
+            cmds[subparser].validate(args)
 
-        if hasattr(args, "dispatch_function"):
-            args.dispatch_function(args)
+        dispatch_function = getattr(args, "dispatch_function", None)
+        if dispatch_function is not None:
+            dispatch_function(args)
         else:
             parser.print_help()
 

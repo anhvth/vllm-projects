@@ -213,14 +213,14 @@ def _jsonable(value: Any) -> Any:
         return value
     if isinstance(value, Enum):
         return value.value
-    if is_dataclass(value):
-        return {key: _jsonable(val) for key, val in asdict(value).items()}
+    if is_dataclass(value) and not isinstance(value, type):
+        return {key: _jsonable(val) for key, val in asdict(value).items()}  # pyright: ignore[reportArgumentType]
     if isinstance(value, dict):
         return {str(key): _jsonable(val) for key, val in value.items()}
     if isinstance(value, list | tuple):
         return [_jsonable(item) for item in value]
     if hasattr(value, "backend"):
-        return {"backend": _jsonable(value.backend)}
+        return {"backend": _jsonable(getattr(value, "backend"))}
     return str(value)
 
 

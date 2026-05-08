@@ -8,7 +8,7 @@ __path__ = extend_path(__path__, __name__)
 
 # The version.py should be independent library, and we always import the
 # version library first.  Such assumption is critical for some customization.
-from .version import __version__, __version_tuple__  # isort:skip
+from .version import __version__, __version_tuple__  # isort:skip  # pyright: ignore[reportMissingImports]
 
 import typing
 
