@@ -14,6 +14,7 @@ E2E_SCRIPT = ROOT / "PR" / "run_hotload_vllm_e2e.sh"
 SHIM_SCRIPT = (
     ROOT / "vllm_patch" / "examples" / "managed_weight_sync" / "hf_push_ipc.py"
 )
+HOTLOADCTL = ROOT / "src" / "vllm_hotload" / "hotloadctl.py"
 SRC = ROOT / "src"
 SKILL_HELPERS = [
     ROOT
@@ -45,6 +46,7 @@ class PackagingRegressionTests(unittest.TestCase):
             data["project"]["scripts"]["vllm-hotload-hf-push-ipc"],
             "vllm_hotload.hf_push_ipc:main",
         )
+        self.assertIn("ray[serve]==2.55.1", data["project"]["dependencies"])
         self.assertIn("src", data["tool"]["setuptools"]["packages"]["find"]["where"])
         self.assertIn(
             "vllm_patch",
@@ -74,6 +76,18 @@ class PackagingRegressionTests(unittest.TestCase):
         self.assertIn("from vllm_hotload.hf_push_ipc import main", content)
         self.assertNotIn("import argparse", content)
         self.assertNotIn("import requests", content)
+
+    def test_hotloadctl_start_stop_paths_no_longer_reference_tmux(self) -> None:
+        content = HOTLOADCTL.read_text()
+
+        self.assertIn("def build_serve_run_command", content)
+        self.assertIn("def build_serve_shutdown_command", content)
+        self.assertNotIn("tmux new-session", content)
+        self.assertNotIn("tmux kill-session", content)
+        self.assertNotIn("ray.init(", content)
+        self.assertNotIn("--ray-bootstrap-script", content)
+        self.assertNotIn("--skip-ray-bootstrap", content)
+        self.assertNotIn("_serve-proxy", content)
 
     def test_managed_hotload_skill_helpers_remain_thin_wrappers(self) -> None:
         for helper in SKILL_HELPERS:

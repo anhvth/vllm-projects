@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import requests
@@ -20,125 +20,142 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from vllm_hotload.hotloadctl import (
-    ClusterState,
-    ReplicaState,
-    collect_cluster_status,
-    main,
-)
+from vllm_hotload.hotloadctl import ClusterState, ReplicaState, collect_cluster_status, main
 from vllm_hotload.proxy import create_app
 
 
+def capture_main_output(args: list[str]) -> dict[str, Any]:
+    with patch("sys.stdout.write") as write_mock:
+        main(args)
+    return json.loads("".join(call.args[0] for call in write_mock.call_args_list))
+
+
 class HotloadCtlTests(unittest.TestCase):
-    def test_start_dry_run_generates_replica_and_proxy_commands(self) -> None:
+    def test_start_dry_run_emits_multi_app_serve_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = Path(tmpdir) / "out.json"
-            args = [
-                "start",
-                "--nodes",
-                "node0,node1,node2",
-                "--gpus-per-replica",
-                "8",
-                "--model-path",
-                "/models/dummy",
-                "--served-model-name",
-                "qwen3-1.7b",
-                "--workspace-dir",
-                tmpdir,
-                "--state-file",
-                str(Path(tmpdir) / "state.json"),
-                "--public-host",
-                "head-node",
-                "--dry-run",
-            ]
-            with patch("sys.stdout.write") as write_mock:
-                main(args)
-            output = "".join(call.args[0] for call in write_mock.call_args_list)
-            output_path.write_text(output)
-            payload = json.loads(output_path.read_text())
-
-        self.assertEqual(payload["public_base_url"], "http://head-node:8000/v1")
-        expected_ray_bootstrap = (
-            f"env RAY_BIN={Path(tmpdir) / '.venv' / 'bin' / 'ray'} "
-            f"{Path('~/images/06-start-ray.sh').expanduser()} -n 3"
-        )
-        self.assertEqual(payload["ray_bootstrap_command"], expected_ray_bootstrap)
-        self.assertIn(
-            "tmux new-session -d -s vllm-hotload-node0-serve",
-            payload["commands"]["node0"],
-        )
-        self.assertIn("--load-format dummy", payload["commands"]["node0"])
-        self.assertIn("--managed-weight-sync", payload["commands"]["node0"])
-        self.assertIn("--enable-sleep-mode", payload["commands"]["node0"])
-        self.assertIn("--weight-transfer-config", payload["commands"]["node0"])
-        self.assertIn('{"backend":"ipc"}', payload["commands"]["node0"])
-        self.assertIn(
-            "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7", payload["commands"]["node0"]
-        )
-        self.assertIn(
-            "tmux new-session -d -s vllm-hotload-proxy", payload["proxy_command"]
-        )
-        self.assertIn("hotloadctl _serve-proxy", payload["proxy_command"])
-
-    def test_start_dry_run_skips_ray_bootstrap_for_single_node(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("sys.stdout.write") as write_mock:
-                main(
-                    [
-                        "start",
-                        "--nodes",
-                        "node0",
-                        "--gpus-per-replica",
-                        "8",
-                        "--model-path",
-                        "/models/dummy",
-                        "--served-model-name",
-                        "qwen3-1.7b",
-                        "--workspace-dir",
-                        tmpdir,
-                        "--state-file",
-                        str(Path(tmpdir) / "state.json"),
-                        "--dry-run",
-                    ]
-                )
-            payload = json.loads(
-                "".join(call.args[0] for call in write_mock.call_args_list)
+            payload = capture_main_output(
+                [
+                    "start",
+                    "--nodes",
+                    "node0,node1,node2",
+                    "--gpus-per-replica",
+                    "8",
+                    "--model-path",
+                    "/models/dummy",
+                    "--served-model-name",
+                    "qwen3-1.7b",
+                    "--workspace-dir",
+                    tmpdir,
+                    "--state-file",
+                    str(Path(tmpdir) / "state.json"),
+                    "--public-host",
+                    "head-node",
+                    "--dry-run",
+                ]
             )
 
-        self.assertIsNone(payload["ray_bootstrap_command"])
+        self.assertEqual(payload["public_base_url"], "http://head-node:8000/v1")
+        self.assertEqual(
+            payload["serve_config_path"],
+            str(Path(tmpdir) / ".hotloadctl" / "serve_config.yaml"),
+        )
+        self.assertIn("serve run", payload["serve_run_command"])
+        self.assertNotIn("tmux", json.dumps(payload))
+
+        applications = payload["serve_config"]["applications"]
+        public_apps = [
+            app
+            for app in applications
+            if app["import_path"] == "vllm_hotload.ray_serve_app:build_public_proxy_app"
+        ]
+        replica_apps = [
+            app
+            for app in applications
+            if app["import_path"] == "vllm_hotload.ray_serve_app:build_vllm_replica_app"
+        ]
+
+        self.assertEqual(len(public_apps), 1)
+        self.assertEqual(public_apps[0]["route_prefix"], "/")
+        self.assertEqual(len(replica_apps), 3)
+        self.assertTrue(
+            all(app["route_prefix"].startswith("/_hotloadctl/replicas/") for app in replica_apps)
+        )
+        self.assertTrue(
+            all(
+                app["deployments"][0]["name"] == "ManagedVLLMReplica"
+                for app in replica_apps
+            )
+        )
+        self.assertTrue(
+            all(
+                app["deployments"][0]["ray_actor_options"]["num_gpus"] == 8
+                for app in replica_apps
+            )
+        )
+
+    def test_start_preflight_surfaces_version_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch(
+                "vllm_hotload.hotloadctl._run_cli",
+                side_effect=RuntimeError(
+                    "ray status failed due to a Ray version mismatch.\ncluster=2.55.1 local=2.54.0"
+                ),
+            ), patch("vllm_hotload.hotloadctl.write_serve_config") as write_config_mock:
+                with self.assertRaisesRegex(RuntimeError, "version mismatch"):
+                    main(
+                        [
+                            "start",
+                            "--nodes",
+                            "localhost",
+                            "--gpus-per-replica",
+                            "1",
+                            "--model-path",
+                            "/models/dummy",
+                            "--served-model-name",
+                            "qwen3-1.7b",
+                            "--workspace-dir",
+                            tmpdir,
+                            "--state-file",
+                            str(Path(tmpdir) / "state.json"),
+                        ]
+                    )
+
+        write_config_mock.assert_not_called()
 
     def test_collect_cluster_status_aggregates_replica_health(self) -> None:
         state = ClusterState(
             workspace_dir="/workspace",
+            ray_address="auto",
+            dashboard_address="http://localhost:8265",
             public_base_url="http://head-node:8000/v1",
             public_host="head-node",
             public_port=8000,
             proxy_host="0.0.0.0",
-            proxy_session_name="vllm-hotload-proxy",
-            base_port=8100,
+            public_app_name="vllm-hotload-public",
+            public_route_prefix="/",
+            serve_config_path="/workspace/.hotloadctl/serve_config.yaml",
             served_model_name="qwen3-1.7b",
             start_model_path="/models/dummy",
             gpus_per_replica=2,
-            ray_address="auto",
             nodes=["node0", "node1"],
             replicas=[
                 ReplicaState(
                     node="node0",
-                    base_url="http://node0:8100",
-                    v1_url="http://node0:8100/v1",
-                    managed_url="http://node0:8100/managed",
-                    session_name="s0",
+                    route_prefix="/_hotloadctl/replicas/1-node0",
+                    base_url="http://head-node:8000/_hotloadctl/replicas/1-node0",
+                    v1_url="http://head-node:8000/_hotloadctl/replicas/1-node0/v1",
+                    managed_url="http://head-node:8000/_hotloadctl/replicas/1-node0/managed",
+                    app_name="vllm-hotload-replica-1-node0",
                     gpus_per_replica=2,
-                    gpu_devices=[0, 1],
                 ),
                 ReplicaState(
                     node="node1",
-                    base_url="http://node1:8100",
-                    v1_url="http://node1:8100/v1",
-                    managed_url="http://node1:8100/managed",
-                    session_name="s1",
+                    route_prefix="/_hotloadctl/replicas/2-node1",
+                    base_url="http://head-node:8000/_hotloadctl/replicas/2-node1",
+                    v1_url="http://head-node:8000/_hotloadctl/replicas/2-node1/v1",
+                    managed_url="http://head-node:8000/_hotloadctl/replicas/2-node1/managed",
+                    app_name="vllm-hotload-replica-2-node1",
                     gpus_per_replica=2,
-                    gpu_devices=[0, 1],
                 ),
             ],
         )
@@ -158,14 +175,19 @@ class HotloadCtlTests(unittest.TestCase):
 
         def fake_request(method: str, url: str, json: object, timeout: float):
             del method, json, timeout
-            if url == "http://node0:8100/managed/status":
+            if url == "http://head-node:8000/_hotloadctl/replicas/1-node0/managed/status":
                 return FakeResponse({"sleeping": False, "model": "qwen3-1.7b"})
-            if url == "http://node0:8100/v1/models":
+            if url == "http://head-node:8000/_hotloadctl/replicas/1-node0/v1/models":
                 return FakeResponse({"data": [{"id": "qwen3-1.7b"}]})
             raise requests.RequestException("node1 down")
 
-        with patch(
-            "vllm_hotload.hotloadctl.requests.request", side_effect=fake_request
+        with patch("requests.request", side_effect=fake_request), patch(
+            "vllm_hotload.hotloadctl._serve_status",
+            return_value={
+                "applications": {
+                    "vllm-hotload-public": {"status": "RUNNING", "message": ""}
+                }
+            },
         ):
             status = collect_cluster_status(state, 5.0)
 
@@ -174,8 +196,9 @@ class HotloadCtlTests(unittest.TestCase):
         self.assertEqual(status["replicas"][0]["managed_status"]["model"], "qwen3-1.7b")
         self.assertEqual(status["replicas"][1]["health"], "unhealthy")
         self.assertIsNone(status["replicas"][1]["managed_status"])
+        self.assertEqual(status["serve_applications"]["vllm-hotload-public"]["status"], "RUNNING")
 
-    def test_push_dry_run_uses_saved_ray_state_and_public_verify(self) -> None:
+    def test_push_dry_run_uses_replica_route_prefix_managed_urls(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
             state_file.write_text(
@@ -183,12 +206,14 @@ class HotloadCtlTests(unittest.TestCase):
                     {
                         "workspace_dir": "/workspace",
                         "ray_address": "auto",
+                        "dashboard_address": "http://localhost:8265",
                         "public_base_url": "http://head-node:8000/v1",
                         "public_host": "head-node",
                         "public_port": 8000,
                         "proxy_host": "0.0.0.0",
-                        "proxy_session_name": "vllm-hotload-proxy",
-                        "base_port": 8100,
+                        "public_app_name": "vllm-hotload-public",
+                        "public_route_prefix": "/",
+                        "serve_config_path": "/workspace/.hotloadctl/serve_config.yaml",
                         "served_model_name": "qwen3-1.7b",
                         "start_model_path": "/models/dummy",
                         "gpus_per_replica": 2,
@@ -196,45 +221,42 @@ class HotloadCtlTests(unittest.TestCase):
                         "replicas": [
                             {
                                 "node": "node0",
-                                "base_url": "http://node0:8100",
-                                "v1_url": "http://node0:8100/v1",
-                                "managed_url": "http://node0:8100/managed",
-                                "session_name": "vllm-hotload-node0-serve",
+                                "route_prefix": "/_hotloadctl/replicas/1-node0",
+                                "base_url": "http://head-node:8000/_hotloadctl/replicas/1-node0",
+                                "v1_url": "http://head-node:8000/_hotloadctl/replicas/1-node0/v1",
+                                "managed_url": "http://head-node:8000/_hotloadctl/replicas/1-node0/managed",
+                                "app_name": "vllm-hotload-replica-1-node0",
                                 "gpus_per_replica": 2,
-                                "gpu_devices": [0, 1],
                             }
                         ],
                     }
                 )
             )
 
-            with patch("sys.stdout.write") as write_mock:
-                main(
-                    [
-                        "push",
-                        "/checkpoints/step-100",
-                        "--state-file",
-                        str(state_file),
-                        "--dry-run",
-                    ]
-                )
-
-            payload = json.loads(
-                "".join(call.args[0] for call in write_mock.call_args_list)
+            payload = capture_main_output(
+                [
+                    "push",
+                    "/checkpoints/step-100",
+                    "--state-file",
+                    str(state_file),
+                    "--dry-run",
+                ]
             )
 
         self.assertEqual(
             payload["public_verify_models"], "http://head-node:8000/v1/models"
         )
-        self.assertTrue(
-            payload["operations"][0]["push_command"].startswith("cd /workspace &&")
+        self.assertEqual(
+            payload["operations"][0]["prepare_weight_update"]["url"],
+            "http://head-node:8000/_hotloadctl/replicas/1-node0/managed/prepare_weight_update",
         )
-        self.assertIn(
-            "--base-url http://127.0.0.1:8100",
-            payload["operations"][0]["push_command"],
+        self.assertEqual(
+            payload["operations"][0]["load_weights"]["url"],
+            "http://head-node:8000/_hotloadctl/replicas/1-node0/managed/load_weights",
         )
+        self.assertNotIn("push_command", payload["operations"][0])
 
-    def test_stop_dry_run_uses_tmux_commands_without_ssh(self) -> None:
+    def test_stop_refuses_shutdown_when_foreign_apps_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
             state_file.write_text(
@@ -242,12 +264,14 @@ class HotloadCtlTests(unittest.TestCase):
                     {
                         "workspace_dir": "/workspace",
                         "ray_address": "auto",
+                        "dashboard_address": "http://localhost:8265",
                         "public_base_url": "http://head-node:8000/v1",
                         "public_host": "head-node",
                         "public_port": 8000,
                         "proxy_host": "0.0.0.0",
-                        "proxy_session_name": "vllm-hotload-proxy",
-                        "base_port": 8100,
+                        "public_app_name": "vllm-hotload-public",
+                        "public_route_prefix": "/",
+                        "serve_config_path": "/workspace/.hotloadctl/serve_config.yaml",
                         "served_model_name": "qwen3-1.7b",
                         "start_model_path": "/models/dummy",
                         "gpus_per_replica": 2,
@@ -255,33 +279,30 @@ class HotloadCtlTests(unittest.TestCase):
                         "replicas": [
                             {
                                 "node": "node0",
-                                "base_url": "http://node0:8100",
-                                "v1_url": "http://node0:8100/v1",
-                                "managed_url": "http://node0:8100/managed",
-                                "session_name": "vllm-hotload-node0-serve",
+                                "route_prefix": "/_hotloadctl/replicas/1-node0",
+                                "base_url": "http://head-node:8000/_hotloadctl/replicas/1-node0",
+                                "v1_url": "http://head-node:8000/_hotloadctl/replicas/1-node0/v1",
+                                "managed_url": "http://head-node:8000/_hotloadctl/replicas/1-node0/managed",
+                                "app_name": "vllm-hotload-replica-1-node0",
                                 "gpus_per_replica": 2,
-                                "gpu_devices": [0, 1],
                             }
                         ],
                     }
                 )
             )
 
-            with patch("sys.stdout.write") as write_mock:
-                main(["stop", "--state-file", str(state_file), "--dry-run"])
-
-            payload = json.loads(
-                "".join(call.args[0] for call in write_mock.call_args_list)
-            )
-
-        self.assertEqual(
-            payload["commands"]["node0"],
-            "tmux kill-session -t vllm-hotload-node0-serve",
-        )
-        self.assertEqual(
-            payload["proxy_command"],
-            "tmux kill-session -t vllm-hotload-proxy",
-        )
+            with patch(
+                "vllm_hotload.hotloadctl._serve_status",
+                return_value={
+                    "applications": {
+                        "vllm-hotload-public": {"status": "RUNNING"},
+                        "vllm-hotload-replica-1-node0": {"status": "RUNNING"},
+                        "other-app": {"status": "RUNNING"},
+                    }
+                },
+            ):
+                with self.assertRaisesRegex(RuntimeError, "non-hotload applications"):
+                    main(["stop", "--state-file", str(state_file)])
 
     def test_proxy_rejects_managed_and_round_robins_healthy_v1(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
