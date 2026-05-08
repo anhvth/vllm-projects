@@ -258,6 +258,116 @@ For iterative checkpoint work, use this loop:
 7. When the next checkpoint arrives, push again into the same server.
 8. When GPUs are needed elsewhere, kill the tmux session.
 
+## Quick Ref - LLaMA Factory Local GSM8K Eval
+
+Use this pattern for quick local evaluation from `/home/anhvth8/projects/LlamaFactory`.
+It is especially useful before scaling back out to worker endpoints.
+
+Key lessons from the `gsm8k-condition-kl-distillation` run:
+
+- Start one localhost managed server on port `7777` so the eval client path matches the existing worker convention.
+- Use a stable served model name such as `stage1-sft`; after hotload, this name stays the API model id even when the backing weights come from a later checkpoint.
+- In downstream eval commands, `--model` must be the served API model id, for example `--model stage1-sft`. Do not pass the checkpoint filesystem path to `--model`; vLLM will return `404 NotFoundError` because `/v1/chat/completions` only knows served model ids.
+- The checkpoint filesystem path belongs in the hotload push command as `hf_push_ipc.py --model-path ...`, not in the eval command.
+- Always verify the exact checkpoint path exists. If a pasted path is missing, locate the matching checkpoint before pushing; do not silently evaluate the dummy server.
+- For a server started with `--max-model-len 4096`, do not request `--max-tokens 4096` in GSM8K eval. That leaves zero room for the prompt and vLLM returns BadRequestError. Use `--max-tokens 1024` for local 4k smoke evals unless the server is restarted with a larger context.
+- The first dummy response can be nonsense; after `hf_push_ipc.py`, run the built-in post-transfer generation or a short chat request to confirm the weights are real.
+
+Local dummy server shape:
+
+```bash
+tmux new-session -d -s vllm-gsm8k-local \
+  "cd /home/anhvth8/vllm_projects && \
+   export PYTHONPATH=/home/anhvth8/vllm_projects/vllm_patch && \
+   export VLLM_SERVER_DEV_MODE=1 && \
+   export VLLM_ALLOW_INSECURE_SERIALIZATION=1 && \
+   unset VLLM_API_KEY && \
+   /home/anhvth8/vllm_projects/.venv/bin/python -m vllm.entrypoints.openai.api_server \
+     /home/anhvth8/projects/LlamaFactory/saves/gsm8k-condition-kl-distillation/stage1-sft \
+     --host 127.0.0.1 \
+     --port 7777 \
+     --served-model-name stage1-sft \
+     --trust-remote-code \
+     --dtype bfloat16 \
+     --load-format dummy \
+     --weight-transfer-config '{\"backend\":\"ipc\"}' \
+     --enable-sleep-mode \
+     --managed-weight-sync \
+     --tensor-parallel-size 1 \
+     --gpu-memory-utilization 0.40 \
+     --max-model-len 4096 \
+     2>&1 | tee /tmp/vllm-gsm8k-local.log"
+```
+
+Readiness checks:
+
+```bash
+curl --fail http://127.0.0.1:7777/managed/status
+curl --fail http://127.0.0.1:7777/v1/models
+```
+
+Push a checkpoint into the running server:
+
+```bash
+cd /home/anhvth8/vllm_projects
+export PYTHONPATH=/home/anhvth8/vllm_projects/vllm_patch
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
+
+/home/anhvth8/vllm_projects/.venv/bin/python \
+  /home/anhvth8/vllm_projects/vllm_patch/examples/managed_weight_sync/hf_push_ipc.py \
+  --model-path /home/anhvth8/projects/LlamaFactory/saves/gsm8k-condition-kl-distillation/stage2-kl-v2/checkpoint-500 \
+  --base-url http://127.0.0.1:7777 \
+  --served-model-name stage1-sft \
+  --target-devices 0 \
+  --skip-before-generate
+```
+
+Run a 100-example GSM8K eval through localhost:
+
+```bash
+cd /home/anhvth8/projects/LlamaFactory
+
+bash tools/eval_gsm8k.sh \
+  --client http://127.0.0.1:7777/v1 \
+  --model stage1-sft \
+  --limit 100 \
+  --max-tokens 1024 \
+  --output-path saves/gsm8k-condition-kl-distillation/stage2-kl-v2/checkpoint-500/gsm8k_eval_100.jsonl
+```
+
+To evaluate another checkpoint, first push that checkpoint path, then keep `--model stage1-sft` in eval:
+
+```bash
+cd /home/anhvth8/vllm_projects
+export PYTHONPATH=/home/anhvth8/vllm_projects/vllm_patch
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
+
+/home/anhvth8/vllm_projects/.venv/bin/python \
+  /home/anhvth8/vllm_projects/vllm_patch/examples/managed_weight_sync/hf_push_ipc.py \
+  --model-path /home/anhvth8/projects/LlamaFactory/saves/gsm8k-condition-kl-distillation/stage2-kl-v2/checkpoint-1000 \
+  --base-url http://127.0.0.1:7777 \
+  --served-model-name stage1-sft \
+  --target-devices 0 \
+  --skip-before-generate
+
+cd /home/anhvth8/projects/LlamaFactory
+
+bash tools/eval_gsm8k.sh \
+  --client http://127.0.0.1:7777/v1 \
+  --model stage1-sft \
+  --limit 100 \
+  --max-tokens 1024 \
+  --output-path saves/gsm8k-condition-kl-distillation/stage2-kl-v2/checkpoint-1000/gsm8k_eval_100.jsonl
+```
+
+Known-good reference result from the first local run:
+
+- Checkpoint: `/home/anhvth8/projects/LlamaFactory/saves/gsm8k-condition-kl-distillation/stage2-kl-v2/checkpoint-500`
+- Eval size: 100 examples
+- Correct: 33 / 100
+- Accuracy: 33.00%
+- Output: `saves/gsm8k-condition-kl-distillation/stage2-kl-v2/checkpoint-500/gsm8k_eval_100.jsonl`
+
 ## Completion Checks
 
 Do not claim success until these are true:

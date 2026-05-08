@@ -257,35 +257,7 @@ class ManagedHotloadClient:
             check=True,
         )
         return result.stdout
-
-
-class ManagedHotloadDemo(ManagedHotloadClient):
-    def __init__(self) -> None:
-        super().__init__(
-            base_url=BASE_URL,
-            served_model_name=SERVED_MODEL_NAME,
-            tp_size=TP_SIZE,
-        )
-        self.server_process = None
-        self.server_log_handle = None
-
-    def wait_for_ready(self, timeout_seconds: int = 600) -> None:
-        deadline = time.time() + timeout_seconds
-        last_error = None
-        while time.time() < deadline:
-            try:
-                self.status()
-                return
-            except Exception as exc:
-                last_error = exc
-                time.sleep(2)
-        raise TimeoutError(f'Server did not become ready: {last_error}')
-
-    def start_dummy_service(self) -> dict:
-        try:
-            return self.status()
-        except Exception:
-            pass
+e 
 
         env = os.environ.copy()
         env['PYTHONPATH'] = str(VLLM_PATCH_DIR)
