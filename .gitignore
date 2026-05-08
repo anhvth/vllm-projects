@@ -29,3 +29,6 @@ PR/logs/
 # IDE
 .vscode/
 .idea/
+
+# Cache
+.cache/
