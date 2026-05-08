@@ -133,10 +133,29 @@ hotloadctl wake
 hotloadctl stop
 ```
 
+The same Ray Serve controller is also exposed through a `vllm serve`-shaped
+multi-node entrypoint:
+
+```bash
+ray-vllm serve ~/ckpt/hf_models/Qwen/Qwen3-1.7B \
+  --nodes node0,node1,node2 \
+  --tensor-parallel-size 8 \
+  --served-model-name qwen3-1.7b \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --fast-loading ram
+
+ray-vllm push ~/ckpt/hf_models/Qwen/Qwen3-1.7B-Base
+ray-vllm status
+ray-vllm sleep --level 1
+ray-vllm wake
+ray-vllm stop
+```
+
 Behavior implemented in this workspace:
 
-* `hotloadctl start` builds one local-GPU `vllm serve` replica per node via
-  tmux, using SSH for remote nodes and a local tmux command for localhost.
+* `hotloadctl start` builds one local-GPU `vllm serve` replica per node as Ray
+  Serve applications, plus a public proxy application.
 * Replica startup enables `--load-format dummy`, `--managed-weight-sync`,
   `--enable-sleep-mode`, and
   `--weight-transfer-config '{"backend":"ipc"}'`.
@@ -151,28 +170,44 @@ Behavior implemented in this workspace:
   replica `/v1` and `/managed` URL and a managed status summary.
 * The public proxy only serves `/v1` traffic, rejects `/managed`, and
   round-robins across healthy replicas.
-* `--dry-run` is available on the remote-touching commands so SSH/tmux commands
-  can be inspected before execution.
+* `--dry-run` is available so the generated Ray Serve config and `serve run`
+  command can be inspected before execution.
+* `ray-vllm serve` maps familiar `vllm serve` flags such as model path,
+  `--served-model-name`, `--tensor-parallel-size`, `--host`, `--port`,
+  `--dtype`, `--max-model-len`, and `--trust-remote-code` onto the Ray Serve
+  multi-replica controller.
+* `ray-vllm serve --fast-loading ram` enables the RAM-stage safetensors loader
+  for initial replica startup and persists that setting so later managed
+  `ray-vllm push` reloads use the same RAM-stage loader options. Use
+  `--fast-loading off` or `--no-fast-loading` to keep normal safetensors
+  loading.
 
 Verified locally in this workspace:
 
-* `python -m unittest tests.test_hotloadctl tests.test_packaging_regression`
-  passes from the shared `.venv`.
+* `python -m unittest tests.test_hotloadctl -q` passes from the workspace.
 * `uvx --from ruff ruff format --check` and `uvx --from ruff ruff check` pass
   for the touched workspace Python files:
   `src/vllm_hotload/hotloadctl.py`, `src/vllm_hotload/proxy.py`, and
   `tests/test_hotloadctl.py`.
 * `uv run --group dev python tools/lint.py --file ...` is clean for the same
   touched Python files.
-* Dry-run command generation for a 3-node start plan, including SSH/tmux
-  commands for both the per-node replicas and the public head-node proxy.
+* Dry-run command generation for a 3-node start plan, including the generated
+  Ray Serve config and `serve run` command.
 * Dry-run push planning verifies per-node IPC helper commands and the public
   `/v1/models` verification target after the fanout.
-* Dry-run stop planning verifies tmux stop commands for both the replicas and
-  the public proxy, reusing the saved SSH user.
+* Dry-run stop planning verifies owned Ray Serve application shutdown.
 * Mocked status aggregation covers healthy and unhealthy replicas.
 * An in-process proxy test verifies that `/managed` is not exposed publicly and
   that healthy `/v1` requests rotate across replicas.
+* `python -m unittest tests.test_hotloadctl -q` passes for the updated
+  `ray-vllm` CLI and RAM-stage reload payload tests.
+* `uvx --from ruff ruff format --check` and `uvx --from ruff ruff check` pass
+  for `src/vllm_hotload/hotloadctl.py`, `src/vllm_hotload/ray_vllm.py`,
+  `src/vllm_hotload/ray_serve_app.py`, `tests/test_hotloadctl.py`, and
+  `tests/test_packaging_regression.py`.
+* `PYTHONPATH=src python -m vllm_hotload.ray_vllm serve ... --fast-loading ram
+  --dry-run` emits a Ray Serve config with one public `/v1` app and per-node
+  managed replicas with `fast_loading_ram: true`.
 
 Still requires real multi-node validation:
 
@@ -189,3 +224,6 @@ Still requires real multi-node validation:
 * The first pass assumes the workspace path and checkpoint path are reachable at
   the same absolute path on every node because the SSH/tmux launch commands use
   the shared workspace state directly.
+* `tests.test_packaging_regression` is currently out of sync with the checked-in
+  `build.sh` / `pyproject.toml` bootstrap shape and fails before exercising the
+  new `ray-vllm` assertion.

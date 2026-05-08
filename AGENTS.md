@@ -61,6 +61,9 @@ All under prefix `/managed` (configurable via `--managed-weight-sync-prefix`):
 
 - **Run the e2e test:** `bash PR/run_hotload_vllm_e2e.sh`
 - **Activate venv:** `source .venv/bin/activate`
+- **Runtime dependencies:** `build.sh` is the only place that may install or pin runtime dependencies for this workspace. Do not add Ray, vLLM, CUDA, `pyarrow`, `starlette`, or serving dependencies to `pyproject.toml`.
+- **Ray Serve demos:** run serving demos from the active `build.sh` venv with `serve run` or `python`, not plain `uv run <demo>`. Plain `uv run` can resolve from `pyproject.toml`, mutate `.venv`, and drop packages installed by `build.sh`.
+- **Ray Serve status:** `serve status` requires the dashboard HTTP address, for example `serve status -a http://100.96.5.35:8265`; `--address auto` is valid for `serve run`, not for status.
 - **Run focused tests:**
   ```bash
   cd /home/anhvth8/vllm_projects
@@ -74,6 +77,16 @@ All under prefix `/managed` (configurable via `--managed-weight-sync-prefix`):
   ```bash
   VLLM_SERVER_DEV_MODE=1 uv run vllm serve ... --managed-weight-sync ...
   ```
+
+## Ray Serve LLM recipes
+
+- Recipe docs live under `docs/recipe/`; matching runnable demos live under `demo/`.
+- Keep recipes focused on text-only LLM serving, especially Qwen/Qwen3-style models.
+- For the hosted three-node Ray cluster, the known node resources are `node:100.96.5.35`, `node:100.96.34.48`, and `node:100.96.31.61`. Prefer explicit node-resource pinning when a recipe claims one replica per node.
+- Ray Serve LLM injects placement groups for vLLM replicas. Do not set `max_replicas_per_node` on LLM deployments because it conflicts with those placement groups.
+- Use replicated single-GPU deployments for data-parallel recipes. If multiple deployments need to expose one public model id, use a custom ingress/router; `build_openai_app` rejects duplicate model ids.
+- Avoid pipeline-parallel Qwen3 smoke tests unless explicitly investigating pipeline parallelism. In this workspace, Qwen3-1.7B with `pipeline_parallel_size=3` failed during vLLM attention backend initialization; node-pinned replicated deployments were the working 3-node path.
+- Keep vLLM pinned through `build.sh`. vLLM 0.20.x wheels require `libcudart.so.13` here, while the host/Torch runtime is CUDA 12.9.
 
 ## Safety
 
