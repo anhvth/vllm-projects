@@ -3,7 +3,7 @@ description: >
   Run pyright on the same analysis targets VS Code/Pylance uses, so the
   reported Problems count matches the editor by default. Use this when
   checking Python type correctness in the managed-weight-sync codebase.
-run: uv run python tools/lint.py {args}
+run: source .venv/bin/activate && uv run --active --no-project python tools/lint.py {args}
 supported:
   - "--file <path> — lint a specific file"
   - "--json — machine-readable JSON output"

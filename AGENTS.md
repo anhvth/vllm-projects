@@ -69,7 +69,7 @@ All under prefix `/managed` (configurable via `--managed-weight-sync-prefix`):
   python -m pytest tests/entrypoints/openai/test_managed_weight_sync.py -q
   ```
 - **Lint with ruff:** `ruff check vllm_patch/ && ruff format --check vllm_patch/`
-- **Lint with pyright (filters overlay noise):** `uv run python tools/lint.py` or `uv run python tools/lint.py --file <path>`
+- **Lint with pyright (filters overlay noise):** after `source .venv/bin/activate`, run `uv run --active --no-project python tools/lint.py` or `uv run --active --no-project python tools/lint.py --file <path>`
 - **Start dev server manually:**
   ```bash
   VLLM_SERVER_DEV_MODE=1 uv run vllm serve ... --managed-weight-sync ...
