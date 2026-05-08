@@ -36,6 +36,9 @@ PR/logs/
 # Auto-generated lockfile
 requirements_lock.txt
 
+# Temporary / scratch
+tmp/
+
 # Pre-downloaded wheels (large binaries)
 wheels/
 .chainlit
