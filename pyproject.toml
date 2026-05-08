@@ -16,6 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
+hotloadctl = "vllm_hotload.hotloadctl:main"
 vllm-hotload-hf-push-ipc = "vllm_hotload.hf_push_ipc:main"
 
 [tool.uv]

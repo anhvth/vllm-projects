@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--keep-alive", action="store_true")
     parser.add_argument("--skip-before-generate", action="store_true")
+    parser.add_argument("--skip-init-weight-transfer", action="store_true")
+    parser.add_argument("--skip-prepare-weight-update", action="store_true")
+    parser.add_argument("--skip-finish-weight-update", action="store_true")
+    parser.add_argument("--skip-after-generate", action="store_true")
     return parser.parse_args()
 
 
@@ -188,17 +192,19 @@ def main() -> None:
         print("Generating before weight transfer:")
         print(chat_completion(client, args.served_model_name, args.prompt))
 
-    print("Initializing managed IPC weight transfer")
-    print(managed_post(base_url, "init_weight_transfer", {"init_info": {}}))
+    if not args.skip_init_weight_transfer:
+        print("Initializing managed IPC weight transfer")
+        print(managed_post(base_url, "init_weight_transfer", {"init_info": {}}))
 
-    print("Preparing server for weight update")
-    print(
-        managed_post(
-            base_url,
-            "prepare_weight_update",
-            {"sleep_level": 2, "wake_weights": True},
+    if not args.skip_prepare_weight_update:
+        print("Preparing server for weight update")
+        print(
+            managed_post(
+                base_url,
+                "prepare_weight_update",
+                {"sleep_level": 2, "wake_weights": True},
+            )
         )
-    )
 
     print(
         "Sending model weights via CUDA IPC to target devices "
@@ -206,17 +212,19 @@ def main() -> None:
     )
     send_weights_http(base_url, model.named_parameters(), target_devices)
 
-    print("Finishing server weight update")
-    print(
-        managed_post(
-            base_url,
-            "finish_weight_update",
-            {"wake_kv_cache": True, "resume": True},
+    if not args.skip_finish_weight_update:
+        print("Finishing server weight update")
+        print(
+            managed_post(
+                base_url,
+                "finish_weight_update",
+                {"wake_kv_cache": True, "resume": True},
+            )
         )
-    )
 
-    print("Generating after weight transfer:")
-    print(chat_completion(client, args.served_model_name, args.prompt))
+    if not args.skip_after_generate:
+        print("Generating after weight transfer:")
+        print(chat_completion(client, args.served_model_name, args.prompt))
 
     if args.keep_alive:
         print("Keeping the source model process alive. Press Ctrl+C to exit.")
