@@ -100,3 +100,92 @@ The managed endpoints and IPC hotload flow are designed around one local vLLM
 server. The next orchestration step is to wrap that proven local flow in a
 multi-replica controller, keeping the public inference endpoint singular and
 the private managed endpoints per-node.
+
+## Workspace implementation status
+
+The workspace package now carries a workspace-scoped `hotloadctl` controller
+plus a minimal public OpenAI proxy for the multi-replica design:
+
+```bash
+hotloadctl start \
+  --nodes node0,node1,node2 \
+  --gpus-per-replica 8 \
+  --model-path ~/ckpt/hf_models/Qwen/Qwen3-1.7B \
+  --served-model-name qwen3-1.7b \
+  --base-port 8100 \
+  --public-port 8000 \
+  --public-host head-node \
+  --ssh-user runner
+
+hotloadctl start \
+  --nodes node0,node1,node2 \
+  --gpus-per-replica 8 \
+  --model-path ~/ckpt/hf_models/Qwen/Qwen3-1.7B \
+  --served-model-name qwen3-1.7b \
+  --public-host head-node \
+  --ssh-user runner \
+  --dry-run
+
+hotloadctl push ~/ckpt/hf_models/Qwen/Qwen3-1.7B-Base
+hotloadctl status
+hotloadctl sleep --level 1
+hotloadctl wake
+hotloadctl stop
+```
+
+Behavior implemented in this workspace:
+
+* `hotloadctl start` builds one local-GPU `vllm serve` replica per node via
+  tmux, using SSH for remote nodes and a local tmux command for localhost.
+* Replica startup enables `--load-format dummy`, `--managed-weight-sync`,
+  `--enable-sleep-mode`, and
+  `--weight-transfer-config '{"backend":"ipc"}'`.
+* The public proxy is started under tmux on `--public-host`; when that host is
+  remote, `hotloadctl` now launches it through SSH instead of incorrectly
+  starting it only on the local controller machine.
+* `hotloadctl push` fans out managed lifecycle calls and then runs the local
+  IPC helper on each target node. The saved cluster state now keeps the
+  configured `ssh_user` so later `push` and `stop` calls reuse the same remote
+  identity by default.
+* `hotloadctl status` reports the single public base URL plus each private
+  replica `/v1` and `/managed` URL and a managed status summary.
+* The public proxy only serves `/v1` traffic, rejects `/managed`, and
+  round-robins across healthy replicas.
+* `--dry-run` is available on the remote-touching commands so SSH/tmux commands
+  can be inspected before execution.
+
+Verified locally in this workspace:
+
+* `python -m unittest tests.test_hotloadctl tests.test_packaging_regression`
+  passes from the shared `.venv`.
+* `uvx --from ruff ruff format --check` and `uvx --from ruff ruff check` pass
+  for the touched workspace Python files:
+  `src/vllm_hotload/hotloadctl.py`, `src/vllm_hotload/proxy.py`, and
+  `tests/test_hotloadctl.py`.
+* `uv run --group dev python tools/lint.py --file ...` is clean for the same
+  touched Python files.
+* Dry-run command generation for a 3-node start plan, including SSH/tmux
+  commands for both the per-node replicas and the public head-node proxy.
+* Dry-run push planning verifies per-node IPC helper commands and the public
+  `/v1/models` verification target after the fanout.
+* Dry-run stop planning verifies tmux stop commands for both the replicas and
+  the public proxy, reusing the saved SSH user.
+* Mocked status aggregation covers healthy and unhealthy replicas.
+* An in-process proxy test verifies that `/managed` is not exposed publicly and
+  that healthy `/v1` requests rotate across replicas.
+
+Still requires real multi-node validation:
+
+* Actual SSH reachability and tmux startup on remote worker nodes and the
+  head-node proxy host.
+* Live readiness checks against `/managed/status` and `/v1/models` for real
+  `vllm serve` replicas on multiple nodes.
+* Real checkpoint fanout over IPC on multiple physical nodes with GPUs.
+* End-to-end public proxy forwarding from a normal OpenAI client against live
+  replicas, including streaming behavior.
+* This workspace currently has no `/home/anhvth8/vllm_projects/vllm` checkout,
+  so verification here is intentionally limited to the workspace package,
+  dry-run command generation, mocked HTTP behavior, and focused local tests.
+* The first pass assumes the workspace path and checkpoint path are reachable at
+  the same absolute path on every node because the SSH/tmux launch commands use
+  the shared workspace state directly.
