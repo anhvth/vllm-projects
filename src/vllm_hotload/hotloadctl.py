@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shlex
 import socket
 import subprocess
@@ -10,15 +12,20 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+import yaml
 
 
 def _requests() -> type:
     import requests as _r
+
     return _r
 
 
 def _requests_exc() -> tuple:
     import requests as _r
+
     return _r.RequestException, _r.ConnectionError
 
 
@@ -26,30 +33,40 @@ DEFAULT_BASE_PORT = 8100
 DEFAULT_PUBLIC_PORT = 8000
 DEFAULT_SESSION_PREFIX = "vllm-hotload"
 DEFAULT_REQUEST_TIMEOUT = 30.0
-DEFAULT_RAY_BOOTSTRAP_SCRIPT = "~/images/06-start-ray.sh"
+DEFAULT_DASHBOARD_ADDRESS = "http://localhost:8265"
+DEFAULT_PRIVATE_ROUTE_ROOT = "/_hotloadctl/replicas"
+DEFAULT_SERVE_CONFIG_NAME = "serve_config.yaml"
+DEFAULT_PROXY_LOCATION = "EveryNode"
+DEFAULT_REPLICA_IMPORT_PATH = "vllm_hotload.ray_serve_app:build_vllm_replica_app"
+DEFAULT_PUBLIC_PROXY_IMPORT_PATH = "vllm_hotload.ray_serve_app:build_public_proxy_app"
+DEFAULT_REPLICA_DEPLOYMENT_NAME = "ManagedVLLMReplica"
+DEFAULT_PROXY_DEPLOYMENT_NAME = "HotloadPublicProxy"
+DEFAULT_SERVER_LOAD_FORMAT = "safetensors"
 
 
 @dataclass(frozen=True)
 class ReplicaState:
     node: str
+    route_prefix: str
     base_url: str
     v1_url: str
     managed_url: str
-    session_name: str
+    app_name: str
     gpus_per_replica: int
-    gpu_devices: list[int]
 
 
 @dataclass(frozen=True)
 class ClusterState:
     workspace_dir: str
     ray_address: str
+    dashboard_address: str
     public_base_url: str
     public_host: str
     public_port: int
     proxy_host: str
-    proxy_session_name: str
-    base_port: int
+    public_app_name: str
+    public_route_prefix: str
+    serve_config_path: str
     served_model_name: str
     start_model_path: str
     gpus_per_replica: int
@@ -61,6 +78,10 @@ def default_state_file(workspace_dir: Path) -> Path:
     return workspace_dir / ".hotloadctl" / "state.json"
 
 
+def default_serve_config_file(workspace_dir: Path) -> Path:
+    return workspace_dir / ".hotloadctl" / DEFAULT_SERVE_CONFIG_NAME
+
+
 def parse_nodes(raw_nodes: str) -> list[str]:
     nodes = [node.strip() for node in raw_nodes.split(",") if node.strip()]
     if not nodes:
@@ -68,38 +89,51 @@ def parse_nodes(raw_nodes: str) -> list[str]:
     return nodes
 
 
-def local_gpu_devices(gpus_per_replica: int) -> list[int]:
-    if gpus_per_replica < 1:
-        raise ValueError("gpus-per-replica must be at least 1.")
-    return list(range(gpus_per_replica))
+def _slugify(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9-]+", "-", value).strip("-").lower()
+
+
+def _build_replica_urls(host: str, port: int, route_prefix: str) -> tuple[str, str, str]:
+    base_url = f"http://{host}:{port}{route_prefix}"
+    return base_url, f"{base_url}/v1", f"{base_url}/managed"
 
 
 def build_cluster_state(args: argparse.Namespace) -> ClusterState:
     workspace_dir = Path(args.workspace_dir).resolve()
     public_host = args.public_host or socket.gethostname()
-    public_base_url = f"http://{public_host}:{args.public_port}/v1"
-    gpu_devices = local_gpu_devices(args.gpus_per_replica)
-    replicas = [
-        ReplicaState(
-            node=node,
-            base_url=f"http://{node}:{args.base_port}",
-            v1_url=f"http://{node}:{args.base_port}/v1",
-            managed_url=f"http://{node}:{args.base_port}/managed",
-            session_name=f"{args.session_prefix}-{node}-serve",
-            gpus_per_replica=args.gpus_per_replica,
-            gpu_devices=gpu_devices,
+    replicas: list[ReplicaState] = []
+
+    for index, node in enumerate(parse_nodes(args.nodes), start=1):
+        node_slug = _slugify(node) or f"node-{index}"
+        route_prefix = f"{DEFAULT_PRIVATE_ROUTE_ROOT}/{index}-{node_slug}"
+        base_url, v1_url, managed_url = _build_replica_urls(
+            public_host,
+            args.public_port,
+            route_prefix,
         )
-        for node in parse_nodes(args.nodes)
-    ]
+        replicas.append(
+            ReplicaState(
+                node=node,
+                route_prefix=route_prefix,
+                base_url=base_url,
+                v1_url=v1_url,
+                managed_url=managed_url,
+                app_name=f"{args.session_prefix}-replica-{index}-{node_slug}",
+                gpus_per_replica=args.gpus_per_replica,
+            )
+        )
+
     return ClusterState(
         workspace_dir=str(workspace_dir),
         ray_address=args.ray_address,
-        public_base_url=public_base_url,
+        dashboard_address=args.dashboard_address,
+        public_base_url=f"http://{public_host}:{args.public_port}/v1",
         public_host=public_host,
         public_port=args.public_port,
         proxy_host=args.proxy_host,
-        proxy_session_name=f"{args.session_prefix}-proxy",
-        base_port=args.base_port,
+        public_app_name=f"{args.session_prefix}-public",
+        public_route_prefix="/",
+        serve_config_path=str(default_serve_config_file(workspace_dir)),
         served_model_name=args.served_model_name,
         start_model_path=str(Path(args.model_path).expanduser()),
         gpus_per_replica=args.gpus_per_replica,
@@ -113,179 +147,58 @@ def save_state(state_file: Path, state: ClusterState) -> None:
     state_file.write_text(json.dumps(asdict(state), indent=2, sort_keys=True) + "\n")
 
 
+def _infer_route_prefix(base_url: str) -> str:
+    path = urlparse(base_url).path
+    return path or "/"
+
+
 def load_state(state_file: Path) -> ClusterState:
     data = json.loads(state_file.read_text())
+    workspace_dir = Path(data["workspace_dir"])
     return ClusterState(
         workspace_dir=data["workspace_dir"],
         ray_address=data.get("ray_address", "auto"),
+        dashboard_address=data.get("dashboard_address", DEFAULT_DASHBOARD_ADDRESS),
         public_base_url=data["public_base_url"],
         public_host=data["public_host"],
         public_port=data["public_port"],
-        proxy_host=data["proxy_host"],
-        proxy_session_name=data["proxy_session_name"],
-        base_port=data["base_port"],
+        proxy_host=data.get("proxy_host", "0.0.0.0"),
+        public_app_name=data.get("public_app_name", f"{DEFAULT_SESSION_PREFIX}-public"),
+        public_route_prefix=data.get("public_route_prefix", "/"),
+        serve_config_path=data.get(
+            "serve_config_path",
+            str(default_serve_config_file(workspace_dir)),
+        ),
         served_model_name=data["served_model_name"],
         start_model_path=data["start_model_path"],
         gpus_per_replica=data["gpus_per_replica"],
         nodes=data["nodes"],
-        replicas=[ReplicaState(**replica) for replica in data["replicas"]],
+        replicas=[
+            ReplicaState(
+                node=replica["node"],
+                route_prefix=replica.get(
+                    "route_prefix",
+                    _infer_route_prefix(replica["base_url"]),
+                ),
+                base_url=replica["base_url"],
+                v1_url=replica["v1_url"],
+                managed_url=replica["managed_url"],
+                app_name=replica.get(
+                    "app_name",
+                    replica.get("session_name", replica["node"]),
+                ),
+                gpus_per_replica=replica.get(
+                    "gpus_per_replica",
+                    data["gpus_per_replica"],
+                ),
+            )
+            for replica in data["replicas"]
+        ],
     )
 
 
 def shell_join(parts: list[str]) -> str:
     return shlex.join(parts)
-
-
-def should_bootstrap_ray(args: argparse.Namespace, state: ClusterState) -> bool:
-    return not args.skip_ray_bootstrap and len(state.replicas) > 1
-
-
-def build_ray_bootstrap_command(state: ClusterState, args: argparse.Namespace) -> str:
-    ray_bin = str(Path(state.workspace_dir) / ".venv" / "bin" / "ray")
-    bootstrap_script = str(Path(args.ray_bootstrap_script).expanduser())
-    return shell_join(
-        [
-            "env",
-            f"RAY_BIN={ray_bin}",
-            bootstrap_script,
-            "-n",
-            str(len(state.replicas)),
-        ]
-    )
-
-
-def build_replica_start_command(
-    state: ClusterState,
-    replica: ReplicaState,
-    args: argparse.Namespace,
-) -> str:
-    workspace_dir = shlex.quote(state.workspace_dir)
-    vllm_bin = str(Path(state.workspace_dir) / ".venv" / "bin" / "vllm")
-    gpu_devices = ",".join(str(index) for index in replica.gpu_devices)
-    serve_command = shell_join(
-        [
-            vllm_bin,
-            "serve",
-            state.start_model_path,
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(state.base_port),
-            "--served-model-name",
-            state.served_model_name,
-            "--dtype",
-            args.dtype,
-            "--load-format",
-            "dummy",
-            "--weight-transfer-config",
-            '{"backend":"ipc"}',
-            "--enable-sleep-mode",
-            "--managed-weight-sync",
-            "--tensor-parallel-size",
-            str(replica.gpus_per_replica),
-            "--gpu-memory-utilization",
-            str(args.gpu_memory_utilization),
-            "--max-model-len",
-            str(args.max_model_len),
-        ]
-        + (["--trust-remote-code"] if args.trust_remote_code else [])
-    )
-    inner = (
-        f"cd {workspace_dir} && "
-        "unset VLLM_API_KEY && "
-        "export VLLM_SERVER_DEV_MODE=1 && "
-        "export VLLM_ALLOW_INSECURE_SERIALIZATION=1 && "
-        f"export CUDA_VISIBLE_DEVICES={shlex.quote(gpu_devices)} && "
-        f"exec {serve_command}"
-    )
-    tmux_command = shell_join(
-        ["tmux", "new-session", "-d", "-s", replica.session_name, inner]
-    )
-    return tmux_command
-
-
-def build_proxy_start_command(state: ClusterState, state_file: Path) -> str:
-    workspace_dir = shlex.quote(state.workspace_dir)
-    hotloadctl_bin = str(Path(state.workspace_dir) / ".venv" / "bin" / "hotloadctl")
-    proxy_command = shell_join(
-        [
-            hotloadctl_bin,
-            "_serve-proxy",
-            "--state-file",
-            str(state_file),
-            "--host",
-            state.proxy_host,
-            "--port",
-            str(state.public_port),
-        ]
-    )
-    inner = f"cd {workspace_dir} && exec {proxy_command}"
-    tmux_command = shell_join(
-        ["tmux", "new-session", "-d", "-s", state.proxy_session_name, inner]
-    )
-    return tmux_command
-
-
-def build_push_helper_command(
-    state: ClusterState,
-    replica: ReplicaState,
-    checkpoint: str,
-    args: argparse.Namespace,
-) -> str:
-    target_devices = ",".join(str(index) for index in replica.gpu_devices)
-    push_bin = str(
-        Path(state.workspace_dir) / ".venv" / "bin" / "vllm-hotload-hf-push-ipc"
-    )
-    helper_parts = [
-        push_bin,
-        "--model-path",
-        checkpoint,
-        "--base-url",
-        f"http://127.0.0.1:{state.base_port}",
-        "--served-model-name",
-        state.served_model_name,
-        "--dtype",
-        args.dtype,
-        "--skip-before-generate",
-        "--skip-after-generate",
-        "--skip-init-weight-transfer",
-        "--skip-prepare-weight-update",
-        "--skip-finish-weight-update",
-    ]
-    if args.server_side_load:
-        helper_parts.append("--server-side-load")
-    else:
-        helper_parts.extend(["--target-devices", target_devices])
-
-    helper_command = shell_join(helper_parts)
-    inner = (
-        f"cd {shlex.quote(state.workspace_dir)} && "
-        "export VLLM_ALLOW_INSECURE_SERIALIZATION=1 && "
-        f"exec {helper_command}"
-    )
-    return inner
-
-
-def build_stop_command(node: str, session_name: str) -> str:
-    del node
-    return shell_join(["tmux", "kill-session", "-t", session_name])
-
-
-def run_shell_command(command: str, dry_run: bool, echo_commands: bool) -> None:
-    if echo_commands or dry_run:
-        print(command)
-    if dry_run:
-        return
-    subprocess.run(command, shell=True, check=True)
-
-
-def is_local_node(node: str) -> bool:
-    local_names = {"127.0.0.1", "localhost", socket.gethostname(), socket.getfqdn()}
-    return node in local_names
-
-
-def should_use_ray_transport(state: ClusterState) -> bool:
-    return len(state.replicas) > 1
 
 
 def resolve_node_ip(node: str) -> str:
@@ -294,59 +207,291 @@ def resolve_node_ip(node: str) -> str:
     return socket.gethostbyname(node)
 
 
-def run_ray_command(state: ClusterState, node: str, command: str) -> None:
-    import ray
+def _workspace_pythonpath(state: ClusterState) -> str:
+    parts = [
+        str(Path(state.workspace_dir) / "src"),
+        str(Path(state.workspace_dir) / "vllm_patch"),
+    ]
+    existing = os.environ.get("PYTHONPATH", "").strip()
+    if existing:
+        parts.append(existing)
+    return os.pathsep.join(parts)
 
-    if not ray.is_initialized():
-        ray.init(address=state.ray_address, ignore_reinit_error=True)
 
-    node_ip = resolve_node_ip(node)
+def _cli_env(state: ClusterState) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _workspace_pythonpath(state)
+    return env
 
-    @ray.remote(num_cpus=0, resources={f"node:{node_ip}": 0.001})
-    def _run_remote_command(command: str) -> dict[str, str]:
-        import os
 
-        env = os.environ.copy()
-        if env.get("CUDA_VISIBLE_DEVICES") == "":
-            env.pop("CUDA_VISIBLE_DEVICES", None)
+def _deployment_env_vars(state: ClusterState) -> dict[str, str]:
+    return {
+        "PYTHONPATH": _workspace_pythonpath(state),
+        "VLLM_SERVER_DEV_MODE": "1",
+        "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
+    }
 
-        completed = subprocess.run(
-            command,
-            shell=True,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
+
+def _workspace_bin(state: ClusterState, name: str) -> str:
+    return str(Path(state.workspace_dir) / ".venv" / "bin" / name)
+
+
+def _format_command_failure(context: str, exc: Exception) -> str:
+    if isinstance(exc, FileNotFoundError):
+        return f"{context} failed because '{exc.filename}' was not found."
+
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"{context} timed out after {exc.timeout} seconds."
+
+    if isinstance(exc, subprocess.CalledProcessError):
+        output = "\n".join(
+            part.strip()
+            for part in (exc.stdout or "", exc.stderr or "")
+            if part and part.strip()
         )
-        return {
-            "returncode": str(completed.returncode),
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
+        lowered = output.lower()
+        if "version" in lowered and "mismatch" in lowered:
+            return f"{context} failed due to a Ray version mismatch.\n{output}"
+        if output:
+            return f"{context} failed.\n{output}"
+        return f"{context} failed with exit code {exc.returncode}."
 
-    result = ray.get(_run_remote_command.remote(command))
-    if result["returncode"] != "0":
-        raise RuntimeError(
-            f"Remote command failed on {node} with exit code {result['returncode']}\n"
-            f"STDOUT:\n{result['stdout']}\nSTDERR:\n{result['stderr']}"
-        )
+    return f"{context} failed: {exc}"
 
 
-def run_command_on_node(
+def _run_cli(
     state: ClusterState,
-    node: str,
-    command: str,
-    dry_run: bool,
+    command: list[str],
+    *,
+    timeout: int = 30,
+    echo_commands: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    if echo_commands:
+        print(shell_join(command))
+
+    try:
+        return subprocess.run(
+            command,
+            cwd=state.workspace_dir,
+            env=_cli_env(state),
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=timeout,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        raise RuntimeError(_format_command_failure(shell_join(command), exc)) from exc
+
+
+def build_ray_status_command(state: ClusterState) -> list[str]:
+    return [_workspace_bin(state, "ray"), "status", "--address", state.ray_address]
+
+
+def build_serve_status_command(state: ClusterState) -> list[str]:
+    return [
+        _workspace_bin(state, "serve"),
+        "status",
+        "--address",
+        state.dashboard_address,
+    ]
+
+
+def build_serve_run_command(state: ClusterState) -> list[str]:
+    return [
+        _workspace_bin(state, "serve"),
+        "run",
+        "--app-dir",
+        str(Path(state.workspace_dir) / "src"),
+        "--address",
+        state.ray_address,
+        "--non-blocking",
+        state.serve_config_path,
+    ]
+
+
+def build_serve_shutdown_command(state: ClusterState) -> list[str]:
+    return [
+        _workspace_bin(state, "serve"),
+        "shutdown",
+        "--yes",
+        "--address",
+        state.dashboard_address,
+    ]
+
+
+def preflight_start(state: ClusterState, echo_commands: bool) -> None:
+    checks = [
+        [_workspace_bin(state, "ray"), "--version"],
+        build_ray_status_command(state),
+        build_serve_status_command(state),
+    ]
+    for command in checks:
+        _run_cli(state, command, timeout=30, echo_commands=echo_commands)
+
+
+def _replica_internal_urls(
+    public_port: int,
+    route_prefix: str,
+) -> tuple[str, str, str]:
+    return _build_replica_urls("127.0.0.1", public_port, route_prefix)
+
+
+def _owned_app_names(state: ClusterState) -> set[str]:
+    return {state.public_app_name, *(replica.app_name for replica in state.replicas)}
+
+
+def _node_resource_key(node: str, strict: bool) -> str:
+    try:
+        return f"node:{resolve_node_ip(node)}"
+    except socket.gaierror as exc:
+        if strict:
+            raise ValueError(f"Unable to resolve node '{node}' to an IP address.") from exc
+        return f"node:{node}"
+
+
+def build_serve_config(
+    state: ClusterState,
+    args: argparse.Namespace,
+    *,
+    strict_node_resolution: bool,
+) -> dict[str, Any]:
+    deployment_runtime_env = {"env_vars": _deployment_env_vars(state)}
+    proxy_replicas = []
+    for replica in state.replicas:
+        base_url, v1_url, managed_url = _replica_internal_urls(
+            state.public_port,
+            replica.route_prefix,
+        )
+        proxy_replicas.append(
+            {
+                "node": replica.node,
+                "base_url": base_url,
+                "v1_url": v1_url,
+                "managed_url": managed_url,
+            }
+        )
+
+    applications: list[dict[str, Any]] = [
+        {
+            "name": state.public_app_name,
+            "route_prefix": state.public_route_prefix,
+            "import_path": DEFAULT_PUBLIC_PROXY_IMPORT_PATH,
+            "args": {"replicas": proxy_replicas},
+            "deployments": [
+                {
+                    "name": DEFAULT_PROXY_DEPLOYMENT_NAME,
+                    "num_replicas": 1,
+                    "ray_actor_options": {
+                        "num_cpus": 0.1,
+                        "runtime_env": deployment_runtime_env,
+                    },
+                }
+            ],
+        }
+    ]
+
+    for replica in state.replicas:
+        applications.append(
+            {
+                "name": replica.app_name,
+                "route_prefix": replica.route_prefix,
+                "import_path": DEFAULT_REPLICA_IMPORT_PATH,
+                "args": {
+                    "model_path": state.start_model_path,
+                    "served_model_name": state.served_model_name,
+                    "gpus_per_replica": replica.gpus_per_replica,
+                    "dtype": args.dtype,
+                    "gpu_memory_utilization": args.gpu_memory_utilization,
+                    "max_model_len": args.max_model_len,
+                    "route_prefix": replica.route_prefix,
+                    "trust_remote_code": args.trust_remote_code,
+                },
+                "deployments": [
+                    {
+                        "name": DEFAULT_REPLICA_DEPLOYMENT_NAME,
+                        "num_replicas": 1,
+                        "max_replicas_per_node": 1,
+                        "ray_actor_options": {
+                            "num_gpus": replica.gpus_per_replica,
+                            "resources": {
+                                _node_resource_key(
+                                    replica.node,
+                                    strict_node_resolution,
+                                ): 0.001,
+                            },
+                            "runtime_env": deployment_runtime_env,
+                        },
+                    }
+                ],
+            }
+        )
+
+    return {
+        "proxy_location": DEFAULT_PROXY_LOCATION,
+        "http_options": {
+            "host": state.proxy_host,
+            "port": state.public_port,
+        },
+        "applications": applications,
+    }
+
+
+def write_serve_config(serve_config_path: Path, serve_config: dict[str, Any]) -> None:
+    serve_config_path.parent.mkdir(parents=True, exist_ok=True)
+    serve_config_path.write_text(yaml.safe_dump(serve_config, sort_keys=False))
+
+
+def _serve_status(state: ClusterState, echo_commands: bool = False) -> dict[str, Any]:
+    completed = _run_cli(
+        state,
+        build_serve_status_command(state),
+        timeout=30,
+        echo_commands=echo_commands,
+    )
+    data = yaml.safe_load(completed.stdout) or {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def wait_for_serve_apps(
+    state: ClusterState,
+    timeout_secs: int,
     echo_commands: bool,
 ) -> None:
-    if echo_commands or dry_run:
-        print(command)
-    if dry_run:
-        return
-    if should_use_ray_transport(state) and not is_local_node(node):
-        run_ray_command(state, node, command)
-        return
-    subprocess.run(command, shell=True, check=True)
+    owned_app_names = _owned_app_names(state)
+    deadline = time.time() + timeout_secs
+    while time.time() < deadline:
+        try:
+            status = _serve_status(state, echo_commands=echo_commands)
+        except RuntimeError:
+            time.sleep(2)
+            continue
+
+        applications = status.get("applications") or {}
+        if all(applications.get(name, {}).get("status") == "RUNNING" for name in owned_app_names):
+            return
+
+        failed = {
+            name: applications.get(name, {})
+            for name in owned_app_names
+            if applications.get(name, {}).get("status") == "DEPLOY_FAILED"
+        }
+        if failed:
+            raise RuntimeError(
+                "Serve reported a deployment failure for: "
+                + ", ".join(sorted(failed))
+            )
+
+        time.sleep(2)
+
+    raise TimeoutError(
+        "Timed out waiting for Ray Serve applications to reach RUNNING state."
+    )
 
 
 def request_json(
@@ -385,9 +530,7 @@ def wait_for_public_proxy(
     deadline = time.time() + timeout_secs
     while time.time() < deadline:
         try:
-            request_json(
-                "GET", f"{state.public_base_url}/models", None, request_timeout
-            )
+            request_json("GET", f"{state.public_base_url}/models", None, request_timeout)
             return
         except _requests_exc()[0]:
             time.sleep(2)
@@ -404,6 +547,7 @@ def collect_replica_status(
         request_json("GET", f"{replica.v1_url}/models", None, request_timeout)
         return {
             "node": replica.node,
+            "route_prefix": replica.route_prefix,
             "private_v1_url": replica.v1_url,
             "private_managed_url": replica.managed_url,
             "health": "healthy",
@@ -412,6 +556,7 @@ def collect_replica_status(
     except _requests_exc()[0] as exc:
         return {
             "node": replica.node,
+            "route_prefix": replica.route_prefix,
             "private_v1_url": replica.v1_url,
             "private_managed_url": replica.managed_url,
             "health": "unhealthy",
@@ -423,13 +568,29 @@ def collect_replica_status(
 def collect_cluster_status(
     state: ClusterState, request_timeout: float
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "public_base_url": state.public_base_url,
         "replicas": [
             collect_replica_status(replica, request_timeout)
             for replica in state.replicas
         ],
     }
+
+    try:
+        serve_status = _serve_status(state)
+    except RuntimeError:
+        return payload
+
+    applications = serve_status.get("applications") or {}
+    payload["serve_applications"] = {
+        name: {
+            "status": details.get("status"),
+            "message": details.get("message"),
+        }
+        for name, details in applications.items()
+        if name in _owned_app_names(state)
+    }
+    return payload
 
 
 def emit_json(payload: Any) -> None:
@@ -440,47 +601,33 @@ def emit_json(payload: Any) -> None:
 def start_command(args: argparse.Namespace) -> None:
     state = build_cluster_state(args)
     state_file = Path(args.state_file).resolve()
+    serve_config = build_serve_config(
+        state,
+        args,
+        strict_node_resolution=not args.dry_run,
+    )
     plan = {
         "public_base_url": state.public_base_url,
-        "ray_bootstrap_command": (
-            build_ray_bootstrap_command(state, args)
-            if should_bootstrap_ray(args, state)
-            else None
-        ),
+        "dashboard_address": state.dashboard_address,
+        "serve_config_path": state.serve_config_path,
         "replicas": [asdict(replica) for replica in state.replicas],
-        "commands": {
-            replica.node: build_replica_start_command(state, replica, args)
-            for replica in state.replicas
-        },
-        "proxy_command": build_proxy_start_command(state, state_file),
+        "serve_config": serve_config,
+        "serve_run_command": shell_join(build_serve_run_command(state)),
     }
     if args.dry_run:
         emit_json(plan)
         return
 
-    if should_bootstrap_ray(args, state):
-        run_shell_command(
-            build_ray_bootstrap_command(state, args),
-            dry_run=False,
-            echo_commands=args.echo_commands,
-        )
-
-    save_state(state_file, state)
-    for replica in state.replicas:
-        run_command_on_node(
-            state,
-            replica.node,
-            build_replica_start_command(state, replica, args),
-            dry_run=False,
-            echo_commands=args.echo_commands,
-        )
-    run_command_on_node(
+    preflight_start(state, args.echo_commands)
+    write_serve_config(Path(state.serve_config_path), serve_config)
+    _run_cli(
         state,
-        state.public_host,
-        build_proxy_start_command(state, state_file),
-        dry_run=False,
+        build_serve_run_command(state),
+        timeout=60,
         echo_commands=args.echo_commands,
     )
+    save_state(state_file, state)
+    wait_for_serve_apps(state, args.ready_timeout_secs, args.echo_commands)
     for replica in state.replicas:
         wait_for_replica(replica, args.ready_timeout_secs, args.request_timeout)
     wait_for_public_proxy(state, args.ready_timeout_secs, args.request_timeout)
@@ -495,12 +642,21 @@ def push_command(args: argparse.Namespace) -> None:
         operations.append(
             {
                 "node": replica.node,
-                "init_weight_transfer": f"{replica.managed_url}/init_weight_transfer",
-                "prepare_weight_update": f"{replica.managed_url}/prepare_weight_update",
-                "push_command": build_push_helper_command(
-                    state, replica, checkpoint, args
-                ),
-                "finish_weight_update": f"{replica.managed_url}/finish_weight_update",
+                "prepare_weight_update": {
+                    "url": f"{replica.managed_url}/prepare_weight_update",
+                    "payload": {"sleep_level": 2, "wake_weights": True},
+                },
+                "load_weights": {
+                    "url": f"{replica.managed_url}/load_weights",
+                    "payload": {
+                        "model_path": checkpoint,
+                        "load_format": DEFAULT_SERVER_LOAD_FORMAT,
+                    },
+                },
+                "finish_weight_update": {
+                    "url": f"{replica.managed_url}/finish_weight_update",
+                    "payload": {"wake_kv_cache": True, "resume": True},
+                },
                 "verify_models": f"{replica.v1_url}/models",
             }
         )
@@ -508,6 +664,7 @@ def push_command(args: argparse.Namespace) -> None:
         emit_json(
             {
                 "checkpoint": checkpoint,
+                "mode": "server-side-load",
                 "operations": operations,
                 "public_verify_models": f"{state.public_base_url}/models",
             }
@@ -516,24 +673,20 @@ def push_command(args: argparse.Namespace) -> None:
 
     results = []
     for replica in state.replicas:
-        init_result = request_json(
-            "POST",
-            f"{replica.managed_url}/init_weight_transfer",
-            {"init_info": {}},
-            args.request_timeout,
-        )
         prepare_result = request_json(
             "POST",
             f"{replica.managed_url}/prepare_weight_update",
             {"sleep_level": 2, "wake_weights": True},
             args.request_timeout,
         )
-        run_command_on_node(
-            state,
-            replica.node,
-            build_push_helper_command(state, replica, checkpoint, args),
-            dry_run=False,
-            echo_commands=args.echo_commands,
+        load_result = request_json(
+            "POST",
+            f"{replica.managed_url}/load_weights",
+            {
+                "model_path": checkpoint,
+                "load_format": DEFAULT_SERVER_LOAD_FORMAT,
+            },
+            args.request_timeout,
         )
         finish_result = request_json(
             "POST",
@@ -547,8 +700,8 @@ def push_command(args: argparse.Namespace) -> None:
         results.append(
             {
                 "node": replica.node,
-                "init_weight_transfer": init_result,
                 "prepare_weight_update": prepare_result,
+                "load_weights": load_result,
                 "finish_weight_update": finish_result,
                 "verify_models": verify_result,
             }
@@ -559,6 +712,7 @@ def push_command(args: argparse.Namespace) -> None:
     emit_json(
         {
             "checkpoint": checkpoint,
+            "mode": "server-side-load",
             "results": results,
             "public_verify_models": public_verify_result,
         }
@@ -609,49 +763,55 @@ def fanout_command(
 def stop_command(args: argparse.Namespace) -> None:
     state_file = Path(args.state_file).resolve()
     state = load_state(state_file)
-    commands = {
-        replica.node: build_stop_command(replica.node, replica.session_name)
-        for replica in state.replicas
+    shutdown_command = build_serve_shutdown_command(state)
+    payload = {
+        "owned_app_names": sorted(_owned_app_names(state)),
+        "shutdown_command": shell_join(shutdown_command),
     }
-    proxy_command = build_stop_command(state.public_host, state.proxy_session_name)
     if args.dry_run:
-        emit_json({"commands": commands, "proxy_command": proxy_command})
+        emit_json(payload)
         return
 
-    for replica in state.replicas:
-        run_command_on_node(
+    serve_status = _serve_status(state, echo_commands=args.echo_commands)
+    applications = serve_status.get("applications") or {}
+    foreign_app_names = sorted(
+        name for name in applications if name not in _owned_app_names(state)
+    )
+    if foreign_app_names and not args.force:
+        raise RuntimeError(
+            "Refusing to shut down Ray Serve because non-hotload applications "
+            f"are still running: {', '.join(foreign_app_names)}. Use --force to override."
+        )
+
+    if applications:
+        _run_cli(
             state,
-            replica.node,
-            commands[replica.node],
-            dry_run=False,
+            shutdown_command,
+            timeout=60,
             echo_commands=args.echo_commands,
         )
-    run_command_on_node(
-        state,
-        state.public_host,
-        proxy_command,
-        dry_run=False,
-        echo_commands=args.echo_commands,
-    )
     state_file.unlink(missing_ok=True)
-    emit_json({"stopped": True, "public_base_url": state.public_base_url})
-
-
-def serve_proxy_command(args: argparse.Namespace) -> None:
-    from vllm_hotload.proxy import run_proxy
-
-    run_proxy(args.state_file, args.host, args.port)
+    emit_json(
+        {
+            "stopped": True,
+            "public_base_url": state.public_base_url,
+            "foreign_app_names": foreign_app_names,
+        }
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hotloadctl",
-        description="Manage per-node managed-hotload vLLM replicas and the public proxy.",
+        description=(
+            "Manage per-node managed-hotload vLLM replicas and the public proxy "
+            "through Ray Serve applications."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser(
-        "start", help="Start per-node replicas and the public proxy."
+        "start", help="Submit per-node replicas and the public proxy to Ray Serve."
     )
     start.add_argument("--nodes", required=True)
     start.add_argument("--gpus-per-replica", required=True, type=int)
@@ -669,18 +829,9 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--max-model-len", type=int, default=4096)
     start.add_argument("--trust-remote-code", action="store_true")
     start.add_argument("--ray-address", default="auto")
+    start.add_argument("--dashboard-address", default=DEFAULT_DASHBOARD_ADDRESS)
     start.add_argument("--ready-timeout-secs", type=int, default=600)
     start.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT)
-    start.add_argument(
-        "--ray-bootstrap-script",
-        default=DEFAULT_RAY_BOOTSTRAP_SCRIPT,
-        help="Script used to bring up the Ray cluster before multi-node starts.",
-    )
-    start.add_argument(
-        "--skip-ray-bootstrap",
-        action="store_true",
-        help="Skip Ray bootstrap even when launching multiple replica nodes.",
-    )
     start.add_argument("--dry-run", action="store_true")
     start.add_argument("--echo-commands", action="store_true")
     start.set_defaults(handler=start_command)
@@ -698,8 +849,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--server-side-load",
         action="store_true",
         help=(
-            "Delegate weight loading to the vLLM server. The server reads "
-            "the checkpoint directly from disk using its RamStageManager."
+            "Deprecated compatibility flag. hotloadctl push now uses the "
+            "managed server-side load endpoint for Serve deployments."
         ),
     )
     push.set_defaults(handler=push_command)
@@ -742,18 +893,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     stop = subparsers.add_parser(
-        "stop", help="Stop per-node tmux sessions and the proxy."
+        "stop", help="Shutdown the owned Ray Serve applications for this hotload cluster."
     )
     stop.add_argument("--state-file")
     stop.add_argument("--dry-run", action="store_true")
     stop.add_argument("--echo-commands", action="store_true")
+    stop.add_argument("--force", action="store_true")
     stop.set_defaults(handler=stop_command)
-
-    proxy = subparsers.add_parser("_serve-proxy")
-    proxy.add_argument("--state-file", required=True)
-    proxy.add_argument("--host", required=True)
-    proxy.add_argument("--port", required=True, type=int)
-    proxy.set_defaults(handler=serve_proxy_command)
 
     return parser
 
@@ -761,6 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
 def normalize_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> argparse.Namespace:
+    del parser
     if getattr(args, "state_file", None) is None:
         workspace_dir = Path(getattr(args, "workspace_dir", Path.cwd())).resolve()
         args.state_file = str(default_state_file(workspace_dir))
