@@ -12,8 +12,10 @@ uv venv --python 3.12 --seed --managed-python "$VENV_DIR" --clear
 source "$VENV_DIR/bin/activate"
 
 echo "=== Installing vLLM + Ray ==="
-uv pip install vllm --torch-backend=auto
-uv pip install 'ray[llm]' 'ray[serve]' boto3
+ # vLLM 0.20.x wheels currently require libcudart.so.13, but this workspace
+ # runs against the CUDA 12.9 runtime exposed by the host and Torch build.
+uv pip install 'vllm==0.19.1' --torch-backend=auto 'ray[llm,serve]==2.55.1' boto3
+# uv pip install 
 
 echo "=== Freezing lock ==="
 uv pip freeze > "$REPO_ROOT/requirements_lock.txt"

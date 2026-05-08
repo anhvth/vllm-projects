@@ -5,10 +5,6 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-hotload-workspace"
 version = "0.1.0"
-requires-python = "==3.12.*"
-dependencies = [
-    "ray[serve]==2.55.1",
-]
 
 [project.scripts]
 hotloadctl = "vllm_hotload.hotloadctl:main"
