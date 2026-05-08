@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,23 +33,34 @@ class ProxyReplica:
     managed_url: str
 
 
+def _coerce_replica(replica: ProxyReplica | dict[str, str]) -> ProxyReplica:
+    if isinstance(replica, ProxyReplica):
+        return replica
+    return ProxyReplica(
+        node=replica["node"],
+        base_url=replica["base_url"],
+        v1_url=replica["v1_url"],
+        managed_url=replica["managed_url"],
+    )
+
+
+def _load_replicas_from_state_file(state_file: Path) -> list[ProxyReplica]:
+    data = json.loads(state_file.read_text())
+    return [_coerce_replica(replica) for replica in data["replicas"]]
+
+
 class ReplicaPool:
-    def __init__(self, state_file: Path, health_timeout: float = 2.0) -> None:
-        self._state_file = state_file
+    def __init__(
+        self,
+        replica_loader: Callable[[], list[ProxyReplica]],
+        health_timeout: float = 2.0,
+    ) -> None:
+        self._replica_loader = replica_loader
         self._health_timeout = health_timeout
         self._cursor = 0
 
     def _load_replicas(self) -> list[ProxyReplica]:
-        data = json.loads(self._state_file.read_text())
-        return [
-            ProxyReplica(
-                node=replica["node"],
-                base_url=replica["base_url"],
-                v1_url=replica["v1_url"],
-                managed_url=replica["managed_url"],
-            )
-            for replica in data["replicas"]
-        ]
+        return self._replica_loader()
 
     async def _is_healthy(
         self, client: httpx.AsyncClient, replica: ProxyReplica
@@ -91,9 +103,8 @@ def _filter_headers(headers: httpx.Headers | dict[str, str]) -> dict[str, str]:
     }
 
 
-def create_app(state_file: str | Path) -> FastAPI:
+def _create_app(pool: ReplicaPool) -> FastAPI:
     app = FastAPI(title="vLLM hotload proxy")
-    pool = ReplicaPool(Path(state_file))
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -164,6 +175,19 @@ def create_app(state_file: str | Path) -> FastAPI:
         )
 
     return app
+
+
+def create_app(state_file: str | Path) -> FastAPI:
+    return _create_app(
+        ReplicaPool(lambda: _load_replicas_from_state_file(Path(state_file)))
+    )
+
+
+def create_app_from_replicas(
+    replicas: Iterable[ProxyReplica | dict[str, str]],
+) -> FastAPI:
+    replica_list = [_coerce_replica(replica) for replica in replicas]
+    return _create_app(ReplicaPool(lambda: list(replica_list)))
 
 
 def run_proxy(state_file: str | Path, host: str, port: int) -> None:
