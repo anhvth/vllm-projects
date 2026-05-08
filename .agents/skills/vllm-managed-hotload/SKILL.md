@@ -77,6 +77,27 @@ Confirm these inputs if the user has not already given them:
 - If the user needs to truly free GPU allocations for training or another job, stop the `tmux` session. Sleep mode is a managed transition step, not a guaranteed substitute for full process exit.
 - If the request becomes multi-node, hand off to the multi-node deployment workflow instead of improvising.
 
+## Multi-node Ray Bootstrap
+
+When the caller says the Ray cluster is already wired up, or wants the standard
+workspace command to bring it up first, use this bootstrap command before any
+multi-node replica launch:
+
+```bash
+export RAY_BIN=/home/anhvth8/vllm_projects/.venv/bin/ray
+~/images/06-start-ray.sh -n 3
+```
+
+Notes:
+
+- This workspace currently reaches workers through the user's SSH config on
+  port `8123`.
+- The observed successful run connected to `worker-0`, `worker-6`, and
+  `worker-12`.
+- Treat this as cluster bring-up only. The managed hotload shape still remains
+  one vLLM replica per physical node, with Ray used for cluster availability
+  and orchestration rather than cross-node IPC weight transfer.
+
 ## Recommended Workflow
 
 ### Step 1 - Verify local prerequisites

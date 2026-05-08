@@ -49,8 +49,6 @@ class HotloadCtlTests(unittest.TestCase):
                 str(Path(tmpdir) / "state.json"),
                 "--public-host",
                 "head-node",
-                "--ssh-user",
-                "runner",
                 "--dry-run",
             ]
             with patch("sys.stdout.write") as write_mock:
@@ -60,7 +58,11 @@ class HotloadCtlTests(unittest.TestCase):
             payload = json.loads(output_path.read_text())
 
         self.assertEqual(payload["public_base_url"], "http://head-node:8000/v1")
-        self.assertIn("ssh runner@node0", payload["commands"]["node0"])
+        expected_ray_bootstrap = (
+            f"env RAY_BIN={Path(tmpdir) / '.venv' / 'bin' / 'ray'} "
+            f"{Path('~/images/06-start-ray.sh').expanduser()} -n 3"
+        )
+        self.assertEqual(payload["ray_bootstrap_command"], expected_ray_bootstrap)
         self.assertIn(
             "tmux new-session -d -s vllm-hotload-node0-serve",
             payload["commands"]["node0"],
@@ -73,11 +75,37 @@ class HotloadCtlTests(unittest.TestCase):
         self.assertIn(
             "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7", payload["commands"]["node0"]
         )
-        self.assertIn("ssh runner@head-node", payload["proxy_command"])
         self.assertIn(
             "tmux new-session -d -s vllm-hotload-proxy", payload["proxy_command"]
         )
         self.assertIn("hotloadctl _serve-proxy", payload["proxy_command"])
+
+    def test_start_dry_run_skips_ray_bootstrap_for_single_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("sys.stdout.write") as write_mock:
+                main(
+                    [
+                        "start",
+                        "--nodes",
+                        "node0",
+                        "--gpus-per-replica",
+                        "8",
+                        "--model-path",
+                        "/models/dummy",
+                        "--served-model-name",
+                        "qwen3-1.7b",
+                        "--workspace-dir",
+                        tmpdir,
+                        "--state-file",
+                        str(Path(tmpdir) / "state.json"),
+                        "--dry-run",
+                    ]
+                )
+            payload = json.loads(
+                "".join(call.args[0] for call in write_mock.call_args_list)
+            )
+
+        self.assertIsNone(payload["ray_bootstrap_command"])
 
     def test_collect_cluster_status_aggregates_replica_health(self) -> None:
         state = ClusterState(
@@ -91,7 +119,7 @@ class HotloadCtlTests(unittest.TestCase):
             served_model_name="qwen3-1.7b",
             start_model_path="/models/dummy",
             gpus_per_replica=2,
-            ssh_user="runner",
+            ray_address="auto",
             nodes=["node0", "node1"],
             replicas=[
                 ReplicaState(
@@ -147,13 +175,14 @@ class HotloadCtlTests(unittest.TestCase):
         self.assertEqual(status["replicas"][1]["health"], "unhealthy")
         self.assertIsNone(status["replicas"][1]["managed_status"])
 
-    def test_push_dry_run_uses_saved_ssh_user_and_public_verify(self) -> None:
+    def test_push_dry_run_uses_saved_ray_state_and_public_verify(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
             state_file.write_text(
                 json.dumps(
                     {
                         "workspace_dir": "/workspace",
+                        "ray_address": "auto",
                         "public_base_url": "http://head-node:8000/v1",
                         "public_host": "head-node",
                         "public_port": 8000,
@@ -163,7 +192,6 @@ class HotloadCtlTests(unittest.TestCase):
                         "served_model_name": "qwen3-1.7b",
                         "start_model_path": "/models/dummy",
                         "gpus_per_replica": 2,
-                        "ssh_user": "runner",
                         "nodes": ["node0"],
                         "replicas": [
                             {
@@ -198,19 +226,22 @@ class HotloadCtlTests(unittest.TestCase):
         self.assertEqual(
             payload["public_verify_models"], "http://head-node:8000/v1/models"
         )
-        self.assertIn("ssh runner@node0", payload["operations"][0]["push_command"])
+        self.assertTrue(
+            payload["operations"][0]["push_command"].startswith("cd /workspace &&")
+        )
         self.assertIn(
             "--base-url http://127.0.0.1:8100",
             payload["operations"][0]["push_command"],
         )
 
-    def test_stop_dry_run_uses_saved_ssh_user_for_proxy(self) -> None:
+    def test_stop_dry_run_uses_tmux_commands_without_ssh(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
             state_file.write_text(
                 json.dumps(
                     {
                         "workspace_dir": "/workspace",
+                        "ray_address": "auto",
                         "public_base_url": "http://head-node:8000/v1",
                         "public_host": "head-node",
                         "public_port": 8000,
@@ -220,7 +251,6 @@ class HotloadCtlTests(unittest.TestCase):
                         "served_model_name": "qwen3-1.7b",
                         "start_model_path": "/models/dummy",
                         "gpus_per_replica": 2,
-                        "ssh_user": "runner",
                         "nodes": ["node0"],
                         "replicas": [
                             {
@@ -244,8 +274,14 @@ class HotloadCtlTests(unittest.TestCase):
                 "".join(call.args[0] for call in write_mock.call_args_list)
             )
 
-        self.assertIn("ssh runner@node0", payload["commands"]["node0"])
-        self.assertIn("ssh runner@head-node", payload["proxy_command"])
+        self.assertEqual(
+            payload["commands"]["node0"],
+            "tmux kill-session -t vllm-hotload-node0-serve",
+        )
+        self.assertEqual(
+            payload["proxy_command"],
+            "tmux kill-session -t vllm-hotload-proxy",
+        )
 
     def test_proxy_rejects_managed_and_round_robins_healthy_v1(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

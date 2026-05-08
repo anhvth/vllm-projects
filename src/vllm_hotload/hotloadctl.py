@@ -11,12 +11,22 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import requests
+
+def _requests() -> type:
+    import requests as _r
+    return _r
+
+
+def _requests_exc() -> tuple:
+    import requests as _r
+    return _r.RequestException, _r.ConnectionError
+
 
 DEFAULT_BASE_PORT = 8100
 DEFAULT_PUBLIC_PORT = 8000
 DEFAULT_SESSION_PREFIX = "vllm-hotload"
 DEFAULT_REQUEST_TIMEOUT = 30.0
+DEFAULT_RAY_BOOTSTRAP_SCRIPT = "~/images/06-start-ray.sh"
 
 
 @dataclass(frozen=True)
@@ -33,6 +43,7 @@ class ReplicaState:
 @dataclass(frozen=True)
 class ClusterState:
     workspace_dir: str
+    ray_address: str
     public_base_url: str
     public_host: str
     public_port: int
@@ -44,7 +55,6 @@ class ClusterState:
     gpus_per_replica: int
     nodes: list[str]
     replicas: list[ReplicaState]
-    ssh_user: str | None = None
 
 
 def default_state_file(workspace_dir: Path) -> Path:
@@ -83,6 +93,7 @@ def build_cluster_state(args: argparse.Namespace) -> ClusterState:
     ]
     return ClusterState(
         workspace_dir=str(workspace_dir),
+        ray_address=args.ray_address,
         public_base_url=public_base_url,
         public_host=public_host,
         public_port=args.public_port,
@@ -92,7 +103,6 @@ def build_cluster_state(args: argparse.Namespace) -> ClusterState:
         served_model_name=args.served_model_name,
         start_model_path=str(Path(args.model_path).expanduser()),
         gpus_per_replica=args.gpus_per_replica,
-        ssh_user=args.ssh_user,
         nodes=[replica.node for replica in replicas],
         replicas=replicas,
     )
@@ -107,6 +117,7 @@ def load_state(state_file: Path) -> ClusterState:
     data = json.loads(state_file.read_text())
     return ClusterState(
         workspace_dir=data["workspace_dir"],
+        ray_address=data.get("ray_address", "auto"),
         public_base_url=data["public_base_url"],
         public_host=data["public_host"],
         public_port=data["public_port"],
@@ -116,7 +127,6 @@ def load_state(state_file: Path) -> ClusterState:
         served_model_name=data["served_model_name"],
         start_model_path=data["start_model_path"],
         gpus_per_replica=data["gpus_per_replica"],
-        ssh_user=data.get("ssh_user"),
         nodes=data["nodes"],
         replicas=[ReplicaState(**replica) for replica in data["replicas"]],
     )
@@ -126,13 +136,22 @@ def shell_join(parts: list[str]) -> str:
     return shlex.join(parts)
 
 
-def is_local_node(node: str) -> bool:
-    local_names = {"127.0.0.1", "localhost", socket.gethostname(), socket.getfqdn()}
-    return node in local_names
+def should_bootstrap_ray(args: argparse.Namespace, state: ClusterState) -> bool:
+    return not args.skip_ray_bootstrap and len(state.replicas) > 1
 
 
-def ssh_target(node: str, ssh_user: str | None) -> str:
-    return node if not ssh_user else f"{ssh_user}@{node}"
+def build_ray_bootstrap_command(state: ClusterState, args: argparse.Namespace) -> str:
+    ray_bin = str(Path(state.workspace_dir) / ".venv" / "bin" / "ray")
+    bootstrap_script = str(Path(args.ray_bootstrap_script).expanduser())
+    return shell_join(
+        [
+            "env",
+            f"RAY_BIN={ray_bin}",
+            bootstrap_script,
+            "-n",
+            str(len(state.replicas)),
+        ]
+    )
 
 
 def build_replica_start_command(
@@ -141,14 +160,11 @@ def build_replica_start_command(
     args: argparse.Namespace,
 ) -> str:
     workspace_dir = shlex.quote(state.workspace_dir)
+    vllm_bin = str(Path(state.workspace_dir) / ".venv" / "bin" / "vllm")
     gpu_devices = ",".join(str(index) for index in replica.gpu_devices)
     serve_command = shell_join(
         [
-            "uv",
-            "run",
-            "--directory",
-            state.workspace_dir,
-            "vllm",
+            vllm_bin,
             "serve",
             state.start_model_path,
             "--host",
@@ -185,21 +201,15 @@ def build_replica_start_command(
     tmux_command = shell_join(
         ["tmux", "new-session", "-d", "-s", replica.session_name, inner]
     )
-    if is_local_node(replica.node):
-        return tmux_command
-
-    return shell_join(["ssh", ssh_target(replica.node, args.ssh_user), tmux_command])
+    return tmux_command
 
 
 def build_proxy_start_command(state: ClusterState, state_file: Path) -> str:
     workspace_dir = shlex.quote(state.workspace_dir)
+    hotloadctl_bin = str(Path(state.workspace_dir) / ".venv" / "bin" / "hotloadctl")
     proxy_command = shell_join(
         [
-            "uv",
-            "run",
-            "--directory",
-            state.workspace_dir,
-            "hotloadctl",
+            hotloadctl_bin,
             "_serve-proxy",
             "--state-file",
             str(state_file),
@@ -213,11 +223,7 @@ def build_proxy_start_command(state: ClusterState, state_file: Path) -> str:
     tmux_command = shell_join(
         ["tmux", "new-session", "-d", "-s", state.proxy_session_name, inner]
     )
-    if is_local_node(state.public_host):
-        return tmux_command
-    return shell_join(
-        ["ssh", ssh_target(state.public_host, state.ssh_user), tmux_command]
-    )
+    return tmux_command
 
 
 def build_push_helper_command(
@@ -227,12 +233,11 @@ def build_push_helper_command(
     args: argparse.Namespace,
 ) -> str:
     target_devices = ",".join(str(index) for index in replica.gpu_devices)
+    push_bin = str(
+        Path(state.workspace_dir) / ".venv" / "bin" / "vllm-hotload-hf-push-ipc"
+    )
     helper_parts = [
-        "uv",
-        "run",
-        "--directory",
-        state.workspace_dir,
-        "vllm-hotload-hf-push-ipc",
+        push_bin,
         "--model-path",
         checkpoint,
         "--base-url",
@@ -258,18 +263,12 @@ def build_push_helper_command(
         "export VLLM_ALLOW_INSECURE_SERIALIZATION=1 && "
         f"exec {helper_command}"
     )
-    if is_local_node(replica.node):
-        return inner
-
-    effective_ssh_user = args.ssh_user or state.ssh_user
-    return shell_join(["ssh", ssh_target(replica.node, effective_ssh_user), inner])
+    return inner
 
 
-def build_stop_command(node: str, session_name: str, ssh_user: str | None) -> str:
-    tmux_command = shell_join(["tmux", "kill-session", "-t", session_name])
-    if is_local_node(node):
-        return tmux_command
-    return shell_join(["ssh", ssh_target(node, ssh_user), tmux_command])
+def build_stop_command(node: str, session_name: str) -> str:
+    del node
+    return shell_join(["tmux", "kill-session", "-t", session_name])
 
 
 def run_shell_command(command: str, dry_run: bool, echo_commands: bool) -> None:
@@ -280,13 +279,84 @@ def run_shell_command(command: str, dry_run: bool, echo_commands: bool) -> None:
     subprocess.run(command, shell=True, check=True)
 
 
+def is_local_node(node: str) -> bool:
+    local_names = {"127.0.0.1", "localhost", socket.gethostname(), socket.getfqdn()}
+    return node in local_names
+
+
+def should_use_ray_transport(state: ClusterState) -> bool:
+    return len(state.replicas) > 1
+
+
+def resolve_node_ip(node: str) -> str:
+    if node in {"127.0.0.1", "localhost"}:
+        return "127.0.0.1"
+    return socket.gethostbyname(node)
+
+
+def run_ray_command(state: ClusterState, node: str, command: str) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        ray.init(address=state.ray_address, ignore_reinit_error=True)
+
+    node_ip = resolve_node_ip(node)
+
+    @ray.remote(num_cpus=0, resources={f"node:{node_ip}": 0.001})
+    def _run_remote_command(command: str) -> dict[str, str]:
+        import os
+
+        env = os.environ.copy()
+        if env.get("CUDA_VISIBLE_DEVICES") == "":
+            env.pop("CUDA_VISIBLE_DEVICES", None)
+
+        completed = subprocess.run(
+            command,
+            shell=True,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return {
+            "returncode": str(completed.returncode),
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+
+    result = ray.get(_run_remote_command.remote(command))
+    if result["returncode"] != "0":
+        raise RuntimeError(
+            f"Remote command failed on {node} with exit code {result['returncode']}\n"
+            f"STDOUT:\n{result['stdout']}\nSTDERR:\n{result['stderr']}"
+        )
+
+
+def run_command_on_node(
+    state: ClusterState,
+    node: str,
+    command: str,
+    dry_run: bool,
+    echo_commands: bool,
+) -> None:
+    if echo_commands or dry_run:
+        print(command)
+    if dry_run:
+        return
+    if should_use_ray_transport(state) and not is_local_node(node):
+        run_ray_command(state, node, command)
+        return
+    subprocess.run(command, shell=True, check=True)
+
+
 def request_json(
     method: str,
     url: str,
     payload: dict[str, Any] | None,
     timeout: float,
 ) -> Any:
-    response = requests.request(method, url, json=payload, timeout=timeout)
+    r = _requests()
+    response = r.request(method, url, json=payload, timeout=timeout)
     response.raise_for_status()
     if response.content:
         return response.json()
@@ -302,7 +372,7 @@ def wait_for_replica(
             request_json("GET", f"{replica.managed_url}/status", None, request_timeout)
             request_json("GET", f"{replica.v1_url}/models", None, request_timeout)
             return
-        except requests.RequestException:
+        except _requests_exc()[0]:
             time.sleep(2)
     raise TimeoutError(
         f"Timed out waiting for replica {replica.node} at {replica.base_url}"
@@ -319,7 +389,7 @@ def wait_for_public_proxy(
                 "GET", f"{state.public_base_url}/models", None, request_timeout
             )
             return
-        except requests.RequestException:
+        except _requests_exc()[0]:
             time.sleep(2)
     raise TimeoutError(f"Timed out waiting for public proxy {state.public_base_url}")
 
@@ -339,7 +409,7 @@ def collect_replica_status(
             "health": "healthy",
             "managed_status": managed,
         }
-    except requests.RequestException as exc:
+    except _requests_exc()[0] as exc:
         return {
             "node": replica.node,
             "private_v1_url": replica.v1_url,
@@ -372,6 +442,11 @@ def start_command(args: argparse.Namespace) -> None:
     state_file = Path(args.state_file).resolve()
     plan = {
         "public_base_url": state.public_base_url,
+        "ray_bootstrap_command": (
+            build_ray_bootstrap_command(state, args)
+            if should_bootstrap_ray(args, state)
+            else None
+        ),
         "replicas": [asdict(replica) for replica in state.replicas],
         "commands": {
             replica.node: build_replica_start_command(state, replica, args)
@@ -383,14 +458,25 @@ def start_command(args: argparse.Namespace) -> None:
         emit_json(plan)
         return
 
+    if should_bootstrap_ray(args, state):
+        run_shell_command(
+            build_ray_bootstrap_command(state, args),
+            dry_run=False,
+            echo_commands=args.echo_commands,
+        )
+
     save_state(state_file, state)
     for replica in state.replicas:
-        run_shell_command(
+        run_command_on_node(
+            state,
+            replica.node,
             build_replica_start_command(state, replica, args),
             dry_run=False,
             echo_commands=args.echo_commands,
         )
-    run_shell_command(
+    run_command_on_node(
+        state,
+        state.public_host,
         build_proxy_start_command(state, state_file),
         dry_run=False,
         echo_commands=args.echo_commands,
@@ -442,7 +528,9 @@ def push_command(args: argparse.Namespace) -> None:
             {"sleep_level": 2, "wake_weights": True},
             args.request_timeout,
         )
-        run_shell_command(
+        run_command_on_node(
+            state,
+            replica.node,
             build_push_helper_command(state, replica, checkpoint, args),
             dry_run=False,
             echo_commands=args.echo_commands,
@@ -521,23 +609,30 @@ def fanout_command(
 def stop_command(args: argparse.Namespace) -> None:
     state_file = Path(args.state_file).resolve()
     state = load_state(state_file)
-    effective_ssh_user = args.ssh_user or state.ssh_user
     commands = {
-        replica.node: build_stop_command(
-            replica.node, replica.session_name, effective_ssh_user
-        )
+        replica.node: build_stop_command(replica.node, replica.session_name)
         for replica in state.replicas
     }
-    proxy_command = build_stop_command(
-        state.public_host, state.proxy_session_name, effective_ssh_user
-    )
+    proxy_command = build_stop_command(state.public_host, state.proxy_session_name)
     if args.dry_run:
         emit_json({"commands": commands, "proxy_command": proxy_command})
         return
 
-    for command in commands.values():
-        run_shell_command(command, dry_run=False, echo_commands=args.echo_commands)
-    run_shell_command(proxy_command, dry_run=False, echo_commands=args.echo_commands)
+    for replica in state.replicas:
+        run_command_on_node(
+            state,
+            replica.node,
+            commands[replica.node],
+            dry_run=False,
+            echo_commands=args.echo_commands,
+        )
+    run_command_on_node(
+        state,
+        state.public_host,
+        proxy_command,
+        dry_run=False,
+        echo_commands=args.echo_commands,
+    )
     state_file.unlink(missing_ok=True)
     emit_json({"stopped": True, "public_base_url": state.public_base_url})
 
@@ -573,9 +668,19 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--gpu-memory-utilization", type=float, default=0.40)
     start.add_argument("--max-model-len", type=int, default=4096)
     start.add_argument("--trust-remote-code", action="store_true")
-    start.add_argument("--ssh-user")
+    start.add_argument("--ray-address", default="auto")
     start.add_argument("--ready-timeout-secs", type=int, default=600)
     start.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT)
+    start.add_argument(
+        "--ray-bootstrap-script",
+        default=DEFAULT_RAY_BOOTSTRAP_SCRIPT,
+        help="Script used to bring up the Ray cluster before multi-node starts.",
+    )
+    start.add_argument(
+        "--skip-ray-bootstrap",
+        action="store_true",
+        help="Skip Ray bootstrap even when launching multiple replica nodes.",
+    )
     start.add_argument("--dry-run", action="store_true")
     start.add_argument("--echo-commands", action="store_true")
     start.set_defaults(handler=start_command)
@@ -585,7 +690,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     push.add_argument("checkpoint")
     push.add_argument("--state-file")
-    push.add_argument("--ssh-user")
     push.add_argument("--dtype", default="bfloat16")
     push.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT)
     push.add_argument("--dry-run", action="store_true")
@@ -641,7 +745,6 @@ def build_parser() -> argparse.ArgumentParser:
         "stop", help="Stop per-node tmux sessions and the proxy."
     )
     stop.add_argument("--state-file")
-    stop.add_argument("--ssh-user")
     stop.add_argument("--dry-run", action="store_true")
     stop.add_argument("--echo-commands", action="store_true")
     stop.set_defaults(handler=stop_command)

@@ -32,3 +32,5 @@ PR/logs/
 
 # Cache
 .cache/
+.chainlit
+.hotloadctl/state.json
