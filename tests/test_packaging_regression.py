@@ -43,6 +43,10 @@ class PackagingRegressionTests(unittest.TestCase):
             "vllm_hotload.hotloadctl:main",
         )
         self.assertEqual(
+            data["project"]["scripts"]["ray-vllm"],
+            "vllm_hotload.ray_vllm:main",
+        )
+        self.assertEqual(
             data["project"]["scripts"]["vllm-hotload-hf-push-ipc"],
             "vllm_hotload.hf_push_ipc:main",
         )

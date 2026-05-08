@@ -8,6 +8,7 @@ version = "0.1.0"
 
 [project.scripts]
 hotloadctl = "vllm_hotload.hotloadctl:main"
+ray-vllm = "vllm_hotload.ray_vllm:main"
 vllm-hotload-hf-push-ipc = "vllm_hotload.hf_push_ipc:main"
 
 [tool.setuptools.packages.find]
