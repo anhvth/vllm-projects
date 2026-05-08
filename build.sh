@@ -13,7 +13,7 @@ source "$VENV_DIR/bin/activate"
 
 echo "=== Installing vLLM + Ray ==="
 uv pip install vllm --torch-backend=auto
-uv pip install 'ray[llm]'
+uv pip install 'ray[llm]' 'ray[serve]' boto3
 
 echo "=== Freezing lock ==="
 uv pip freeze > "$REPO_ROOT/requirements_lock.txt"
