@@ -8,6 +8,7 @@ These recipes are intended to run from the workspace virtualenv created by
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,12 @@ DEFAULT_NODE_RESOURCES = (
     "node:100.96.34.48",
     "node:100.96.31.61",
 )
+WORKER_PYTHON = sys.executable
+DEFAULT_LOAD_FORMAT = "safetensors"
+DEFAULT_SAFETENSORS_LOAD_STRATEGY = "ram_stage"
+DEFAULT_RAM_STAGE_NUM_WORKERS = 8
+DEFAULT_RAM_STAGE_COPY_DELAY = 0.0
+DEFAULT_RAM_STAGE_SMALL_FILE_THRESHOLD = 10_000_000
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,37 @@ def env_list(name: str, default: tuple[str, ...]) -> list[str]:
 
 def optional_env_vars(*names: str) -> dict[str, str]:
     return {name: value for name in names if (value := os.environ.get(name))}
+
+
+def recipe_runtime_env() -> dict[str, Any]:
+    runtime_env: dict[str, Any] = {
+        "env_vars": optional_env_vars("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"),
+        # Force worker processes to use the shared build.sh venv instead of
+        # inheriting `uv run`'s temporary runtime env wrapper.
+        "py_executable": WORKER_PYTHON,
+    }
+    return runtime_env
+
+
+def ensure_ray_initialized() -> None:
+    if ray.is_initialized():
+        return
+
+    ray.init(
+        address=os.environ.get("RAY_ADDRESS", "auto"),
+        runtime_env=recipe_runtime_env(),
+    )
+
+
+def ingress_deployment_options(llm_configs: list[LLMConfig]) -> dict[str, Any]:
+    options = RoundRobinOpenAiIngress.get_deployment_options(llm_configs)
+    ray_actor_options = dict(options.get("ray_actor_options", {}))
+    ray_actor_options["runtime_env"] = {
+        **ray_actor_options.get("runtime_env", {}),
+        **recipe_runtime_env(),
+    }
+    options["ray_actor_options"] = ray_actor_options
+    return options
 
 
 class RoundRobinOpenAiIngress(OpenAiIngress):
@@ -127,12 +165,30 @@ def _engine_kwargs(recipe: TextLLMRecipe) -> tuple[dict[str, Any], int]:
     )
     enforce_eager = env_bool("RAY_SERVE_ENFORCE_EAGER", recipe.enforce_eager)
     dtype = os.environ.get("RAY_SERVE_DTYPE", recipe.dtype or "")
+    load_format = os.environ.get("RAY_SERVE_LOAD_FORMAT", DEFAULT_LOAD_FORMAT)
+    safetensors_load_strategy = os.environ.get(
+        "RAY_SERVE_SAFETENSORS_LOAD_STRATEGY",
+        DEFAULT_SAFETENSORS_LOAD_STRATEGY,
+    )
+    ram_stage_num_workers = env_int(
+        "RAY_SERVE_RAM_STAGE_NUM_WORKERS",
+        DEFAULT_RAM_STAGE_NUM_WORKERS,
+    )
+    ram_stage_copy_delay = env_float(
+        "RAY_SERVE_RAM_STAGE_COPY_DELAY",
+        DEFAULT_RAM_STAGE_COPY_DELAY,
+    )
+    ram_stage_small_file_threshold = env_int(
+        "RAY_SERVE_RAM_STAGE_SMALL_FILE_THRESHOLD",
+        DEFAULT_RAM_STAGE_SMALL_FILE_THRESHOLD,
+    )
 
     engine_kwargs: dict[str, Any] = {
         "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": pipeline_parallel_size,
         "max_model_len": max_model_len,
         "trust_remote_code": trust_remote_code,
+        "load_format": load_format,
     }
     if gpu_memory_utilization is not None:
         engine_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
@@ -140,6 +196,17 @@ def _engine_kwargs(recipe: TextLLMRecipe) -> tuple[dict[str, Any], int]:
         engine_kwargs["enforce_eager"] = enforce_eager
     if dtype:
         engine_kwargs["dtype"] = dtype
+    if load_format == "safetensors" and safetensors_load_strategy not in {
+        "",
+        "off",
+        "none",
+    }:
+        engine_kwargs["safetensors_load_strategy"] = safetensors_load_strategy
+        engine_kwargs["model_loader_extra_config"] = {
+            "ram_stage_num_workers": ram_stage_num_workers,
+            "ram_stage_copy_delay": ram_stage_copy_delay,
+            "ram_stage_small_file_threshold": ram_stage_small_file_threshold,
+        }
 
     gpus_per_replica = tensor_parallel_size * pipeline_parallel_size
     if gpus_per_replica > 1:
@@ -187,6 +254,8 @@ def _deployment_config(
 
 
 def build_text_llm_app(recipe: TextLLMRecipe):
+    ensure_ray_initialized()
+
     model_id = os.environ.get("RAY_SERVE_MODEL_ID", recipe.model_id)
     model_source = os.path.expanduser(
         os.environ.get("RAY_SERVE_MODEL_SOURCE", recipe.model_source)
@@ -242,9 +311,7 @@ def build_text_llm_app(recipe: TextLLMRecipe):
                 max_ongoing_requests=max_ongoing_requests,
             ),
             "engine_kwargs": engine_kwargs,
-            "runtime_env": {
-                "env_vars": optional_env_vars("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
-            },
+            "runtime_env": recipe_runtime_env(),
         }
         if placement_group_config is not None:
             llm_config_kwargs["placement_group_config"] = placement_group_config
@@ -263,11 +330,10 @@ def build_text_llm_app(recipe: TextLLMRecipe):
     ingress_cls = make_fastapi_ingress(RoundRobinOpenAiIngress)
     return serve.deployment(
         ingress_cls,
-        **RoundRobinOpenAiIngress.get_deployment_options(llm_configs),
-    ).bind(llm_deployments=llm_deployments)
+        **ingress_deployment_options(llm_configs),
+    ).bind(llm_deployments=llm_deployments)  # type: ignore
 
 
 def run_app(app) -> None:
-    if not ray.is_initialized():
-        ray.init(address=os.environ.get("RAY_ADDRESS", "auto"))
+    ensure_ray_initialized()
     serve.run(app, blocking=True)

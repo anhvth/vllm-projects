@@ -1,6 +1,8 @@
 {
     "include": [
         ".agents/skills/vllm-managed-hotload/scripts",
+        "demo",
+        "src",
         "vllm_patch"
     ],
     "exclude": [
@@ -13,6 +15,7 @@
     ],
     "extraPaths": [
         ".agents/skills/vllm-managed-hotload/scripts",
+        "src",
         "vllm_patch"
     ],
     "typeCheckingMode": "standard",

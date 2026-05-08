@@ -1,0 +1,53 @@
+{
+  "dashboard_address": "http://100.96.5.35:8265",
+  "fast_loading_ram": true,
+  "gpus_per_replica": 8,
+  "nodes": [
+    "100.96.5.35",
+    "100.96.34.48",
+    "100.96.31.61"
+  ],
+  "proxy_host": "0.0.0.0",
+  "public_app_name": "vllm-hotload-public",
+  "public_base_url": "http://100.96.5.35:8000/v1",
+  "public_host": "100.96.5.35",
+  "public_port": 8000,
+  "public_route_prefix": "/",
+  "ram_stage_copy_delay": 0.0,
+  "ram_stage_num_workers": 8,
+  "ram_stage_small_file_threshold": 10000000,
+  "ray_address": "auto",
+  "replicas": [
+    {
+      "app_name": "vllm-hotload-replica-1-100-96-5-35",
+      "base_url": "http://100.96.5.35:8000/_hotloadctl/replicas/1-100-96-5-35",
+      "gpus_per_replica": 8,
+      "managed_url": "http://100.96.5.35:8000/_hotloadctl/replicas/1-100-96-5-35/managed",
+      "node": "100.96.5.35",
+      "route_prefix": "/_hotloadctl/replicas/1-100-96-5-35",
+      "v1_url": "http://100.96.5.35:8000/_hotloadctl/replicas/1-100-96-5-35/v1"
+    },
+    {
+      "app_name": "vllm-hotload-replica-2-100-96-34-48",
+      "base_url": "http://100.96.5.35:8000/_hotloadctl/replicas/2-100-96-34-48",
+      "gpus_per_replica": 8,
+      "managed_url": "http://100.96.5.35:8000/_hotloadctl/replicas/2-100-96-34-48/managed",
+      "node": "100.96.34.48",
+      "route_prefix": "/_hotloadctl/replicas/2-100-96-34-48",
+      "v1_url": "http://100.96.5.35:8000/_hotloadctl/replicas/2-100-96-34-48/v1"
+    },
+    {
+      "app_name": "vllm-hotload-replica-3-100-96-31-61",
+      "base_url": "http://100.96.5.35:8000/_hotloadctl/replicas/3-100-96-31-61",
+      "gpus_per_replica": 8,
+      "managed_url": "http://100.96.5.35:8000/_hotloadctl/replicas/3-100-96-31-61/managed",
+      "node": "100.96.31.61",
+      "route_prefix": "/_hotloadctl/replicas/3-100-96-31-61",
+      "v1_url": "http://100.96.5.35:8000/_hotloadctl/replicas/3-100-96-31-61/v1"
+    }
+  ],
+  "serve_config_path": "/home/anhvth8/vllm_projects/.hotloadctl/serve_config.yaml",
+  "served_model_name": "qwen3-32b",
+  "start_model_path": "/home/anhvth8/ckpt/hf_models/Qwen/Qwen3-32B",
+  "workspace_dir": "/home/anhvth8/vllm_projects"
+}

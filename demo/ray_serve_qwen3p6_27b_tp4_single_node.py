@@ -7,7 +7,11 @@ Run from the build.sh-managed venv:
 
 from __future__ import annotations
 
-from demo.ray_serve_text_llm_recipes import TextLLMRecipe, build_text_llm_app, run_app
+from vllm_hotload.ray_serve_text_llm_recipes import (
+    TextLLMRecipe,
+    build_text_llm_app,
+    run_app,
+)
 
 
 RECIPE = TextLLMRecipe(
