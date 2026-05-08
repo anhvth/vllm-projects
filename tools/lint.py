@@ -25,6 +25,8 @@ Exit code:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -77,6 +79,8 @@ _SETTINGS_NOT_OVERRIDABLE = frozenset({
 # Default excludes that Pylance expects in exclude lists
 _VSCODE_DEFAULT_EXCLUDES = frozenset({"**/.*"})
 _PYRIGHT_DEFAULT_EXCLUDES = frozenset({"**/node_modules", "**/__pycache__", "**/.*"})
+_CACHE_DIR_NAME = ".cache/lint_pyright"
+_CACHE_INPUT_EXTENSIONS = frozenset({".py", ".pyi", ".json", ".toml", ".yaml", ".yml"})
 
 
 def _is_known_noise(diag: dict) -> bool:
@@ -144,6 +148,105 @@ def _resolve_analysis_targets(root: str) -> list[str]:
         return [root]
 
     return list(dict.fromkeys(targets))
+
+
+def _iter_cache_input_files(root: str, targets: list[str]) -> list[str]:
+    paths: set[str] = {
+        os.path.abspath(__file__),
+        os.path.join(root, "pyproject.toml"),
+        os.path.join(root, "pyrightconfig.json"),
+        os.path.join(root, ".vscode", "settings.json"),
+    }
+
+    for target in targets:
+        normalized_target = os.path.abspath(target)
+        if os.path.isfile(normalized_target):
+            paths.add(normalized_target)
+            continue
+
+        if not os.path.isdir(normalized_target):
+            continue
+
+        for dirpath, dirnames, filenames in os.walk(normalized_target):
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if dirname not in {"__pycache__", ".git", ".venv", ".mypy_cache", ".pytest_cache"}
+            ]
+            for filename in filenames:
+                if os.path.splitext(filename)[1] not in _CACHE_INPUT_EXTENSIONS:
+                    continue
+                paths.add(os.path.join(dirpath, filename))
+
+    return sorted(path for path in paths if os.path.exists(path))
+
+
+def _pyright_version() -> str:
+    try:
+        return importlib.metadata.version("pyright")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _build_cache_key(root: str, targets: list[str]) -> str:
+    payload = json.dumps(
+        {
+            "root": root,
+            "targets": [os.path.relpath(target, root) for target in targets],
+            "python": sys.executable,
+            "pyright": _pyright_version(),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_cache_fingerprint(root: str, targets: list[str]) -> dict:
+    files = []
+    for path in _iter_cache_input_files(root, targets):
+        stat_result = os.stat(path)
+        files.append(
+            {
+                "path": os.path.relpath(path, root),
+                "mtime_ns": stat_result.st_mtime_ns,
+                "size": stat_result.st_size,
+            }
+        )
+
+    return {
+        "files": files,
+        "pyright": _pyright_version(),
+        "python": sys.executable,
+    }
+
+
+def _cache_path(root: str, cache_key: str) -> str:
+    return os.path.join(root, _CACHE_DIR_NAME, f"{cache_key}.json")
+
+
+def _load_cached_report(root: str, targets: list[str]) -> dict | None:
+    cache_file = _cache_path(root, _build_cache_key(root, targets))
+    try:
+        with open(cache_file, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+    if payload.get("fingerprint") != _build_cache_fingerprint(root, targets):
+        return None
+
+    return payload.get("report")
+
+
+def _store_cached_report(root: str, targets: list[str], report: dict) -> None:
+    cache_file = _cache_path(root, _build_cache_key(root, targets))
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    payload = {
+        "fingerprint": _build_cache_fingerprint(root, targets),
+        "report": report,
+    }
+    with open(cache_file, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
 
 
 def _check_vscode_settings(root: str) -> list[dict]:
@@ -273,6 +376,11 @@ def main() -> int:
         action="store_true",
         help="Include the resolved analysis targets in output",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Force a fresh pyright run instead of reusing cached results",
+    )
     parser.add_argument("--help", action="store_true", help="Show this help")
     args, _ = parser.parse_known_args()
 
@@ -298,24 +406,29 @@ def main() -> int:
 
     project = os.path.join(root, "pyrightconfig.json")
 
-    # Run pyright.
-    cmd = [
-        sys.executable,
-        "-m",
-        "pyright",
-        "--outputjson",
-        "--project",
-        project,
-        *targets,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=root)
+    cached = False
+    report = None if args.no_cache else _load_cached_report(root, targets)
+    if report is not None:
+        cached = True
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pyright",
+            "--outputjson",
+            "--project",
+            project,
+            *targets,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=root)
 
-    # Parse output
-    try:
-        report = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError):
-        print(result.stderr or result.stdout, file=sys.stderr)
-        return 1
+        try:
+            report = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            print(result.stderr or result.stdout, file=sys.stderr)
+            return 1
+
+        _store_cached_report(root, targets, report)
 
     diagnostics: list[dict] = report.get("generalDiagnostics", [])
     real_diagnostics = [diag for diag in diagnostics if not _is_known_noise(diag)]
@@ -340,6 +453,7 @@ def main() -> int:
                 "filteredCount": filtered_count,
                 "analysisTargets": targets,
                 "timeInSec": report.get("summary", {}).get("timeInSec", 0),
+                "cached": cached,
             },
         }
         # Merge config diags into generalDiagnostics for total picture
@@ -365,7 +479,7 @@ def main() -> int:
         print(
             f"\n[summary] targets={len(targets)}, files={report.get('summary', {}).get('filesAnalyzed', 0)}, "
             f"diagnostics={total} (pyright={len(real_diagnostics)}, config={cfgs}), filtered={filtered_count}, "
-            f"time={report.get('summary', {}).get('timeInSec', 0)}s"
+            f"time={report.get('summary', {}).get('timeInSec', 0)}s, cached={'yes' if cached else 'no'}"
         )
 
     return rc
